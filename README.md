@@ -15,7 +15,7 @@ word overlap.
 ```
 telegraph-wasm-baseline/
 ├── src/
-│   ├── lib.rs         exports: rank_answer, rank_answer_cached, breakdown_answer,
+│   ├── lib.rs         exports: rank_answer, breakdown_answer,
 │   │                  embed, cosine_sim, bm25_score, alloc, dealloc
 │   ├── embed.rs        MiniLM-L6-v2 inference (two modes, see below)
 │   ├── tokenizer.rs     BERT-style tokenizer feeding embed.rs
@@ -84,11 +84,6 @@ meantime.
 A minimal scoring module only needs `alloc` / `dealloc` / `rank_answer`.
 This module also exports:
 
-- `rank_answer_cached` — same composite score, but takes pre-embedded
-  question/ground-truth vectors instead of re-embedding them every call.
-  Embedding is the expensive part of scoring; when many miners answer the
-  same question, embedding it once and reusing the vector avoids redoing
-  that work per miner.
 - `breakdown_answer` — returns the four individual signals (relevance,
   correctness, lexical, length) plus the composite, for debugging why a
   score came out the way it did instead of just the final number.
