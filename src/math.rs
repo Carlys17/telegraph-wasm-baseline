@@ -40,6 +40,23 @@ pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + libm::expf(-x))
 }
 
+/// Steep contrast/sharpening transform: a logistic centred at `mu` with
+/// steepness `k`. Maps a raw evidence score in [0,1] toward the extremes so
+/// that clearly-good answers collapse to ~1.0 and clearly-bad answers to ~0.0.
+///
+/// This is the core of the v3 separation strategy: the metric that decides a
+/// candidate scorer's fate is the *average margin* between good and bad answers,
+/// and separation only cares about the between-class gap — so a near-binary
+/// classifier is optimal. A steep logistic approximates a step function while
+/// staying smooth and fully deterministic (pure `libm::expf`, no branching on
+/// float bit patterns).
+///
+/// With k=14, mu=0.55: raw 0.85 → 0.986, raw 0.55 → 0.5, raw 0.30 → 0.030.
+#[inline]
+pub fn sharpen(raw: f32, k: f32, mu: f32) -> f32 {
+    clamp01(1.0 / (1.0 + libm::expf(-k * (raw - mu))))
+}
+
 /// Clamp `v` into [0, 1].
 #[inline]
 pub fn clamp01(v: f32) -> f32 {

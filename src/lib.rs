@@ -47,14 +47,16 @@ const IDX_LEXICAL:      usize = 2;
 const IDX_LENGTH:       usize = 3;
 const IDX_COMPOSITE:    usize = 4;
 
-// ── Composite scoring weights ─────────────────────────────────────────────────
-// Single source of truth: rank_answer, breakdown_answer, AND rank_answer_cached
-// all compute the composite the same way, from these same constants. Callers
-// on the Go side (pkg/scoring) must never reimplement this formula — see
-// runtime.go's doc comments on RankAnswer/BreakdownAnswer/RankAnswerCached.
+// ── Legacy v1 composite weights (retained for reference / breakdown labels) ───
+// v3 no longer uses a linear weighted blend — see composite_v3 below. These are
+// kept only so the breakdown buffer field order stays documented and stable.
+#[allow(dead_code)]
 const W_RELEVANCE:   f32 = 0.25; // cosine(question,     miner_answer)
+#[allow(dead_code)]
 const W_CORRECTNESS: f32 = 0.50; // cosine(ground_truth, miner_answer)
+#[allow(dead_code)]
 const W_LEXICAL:     f32 = 0.15; // bm25(ground_truth,   miner_answer)
+#[allow(dead_code)]
 const W_LENGTH:      f32 = 0.10; // sigmoid length-quality penalty
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,22 +119,71 @@ unsafe fn signals_from_vecs(
 ) -> (f32, f32, f32, f32) {
     let relevance = math::cosine(q_vec, ma_vec);
     let correctness = math::cosine(gt_vec, ma_vec);
-    let lexical = bm25::score(ground_truth, miner_answer);
-    // Gaming-resistant length: score length RELATIVE to the ground truth
-    // instead of the baseline's absolute sigmoid(len-50), which handed free
-    // points to padded/farmed answers regardless of relevance.
-    let len_quality = antigame::relative_length_quality(ground_truth, miner_answer);
 
-    (relevance, correctness, lexical, len_quality)
+    // Lexical agreement for factual intents = BM25 overlap blended 50/50 with a
+    // critical-token (digit-bearing fact) match. BM25 alone can't tell a correct
+    // "CVSS 9.8" from a wrong "CVSS 7.5" when the surrounding words match; the
+    // critical-token signal keys exactly on the numbers/ids/versions that carry
+    // the truth, giving the gate real discriminating power on wrong-number answers.
+    let bm25 = bm25::score(ground_truth, miner_answer);
+    let crit = antigame::critical_token_match(ground_truth, miner_answer);
+    let lexical = 0.5 * bm25 + 0.5 * crit;
+
+    // Length ratio (answer tokens / ground-truth tokens) drives only the hard
+    // degenerate gate, not a smooth score term.
+    let len_ratio = antigame::answer_len_ratio(ground_truth, miner_answer);
+
+    (relevance, correctness, lexical, len_ratio)
 }
 
+// ── Composite scoring: v3 separation-first design ────────────────────────────
+// The Track-2 metric that decides win/lose is SEPARATION (average margin
+// between good and bad answers), NOT calibrated absolute scores. v2 lost at
+// 0.3944 vs champion 0.8081 because smooth multiplicative penalties + a linear
+// weighted blend pulled every score toward the middle. v3 fixes this in two
+// moves:
+//   1. Build a single raw "evidence" score in [0,1] where correctness (cosine
+//      to ground truth) is gated by lexical agreement (BM25 + critical-token
+//      match) — a topically-similar but factually-wrong answer can't ride
+//      cosine alone.
+//   2. Push that raw evidence through a STEEP logistic (math::sharpen) so
+//      clearly-good answers collapse toward 1.0 and clearly-bad toward 0.0.
+//      Separation only cares about the between-class gap, so a near-binary
+//      classifier is optimal; the steep logistic approximates a step function
+//      while staying smooth and deterministic.
+// Gaming defence is a hard 0 gate (antigame::is_degenerate), applied before
+// scoring — NOT a smooth multiplier — so it widens separation instead of
+// compressing it.
+
+/// Steepness of the final sharpening logistic. k=14 gives f(0.85)=0.986,
+/// f(0.55)=0.5, f(0.30)=0.030 — a hard, near-binary contrast around the midpoint.
+const SHARPEN_K:  f32 = 14.0;
+/// Midpoint of the sharpening logistic, tuned to MiniLM's anisotropic operating
+/// range (unrelated pairs ~0.2-0.4, related ~0.5-0.7, near-duplicate ~0.85+).
+const SHARPEN_MU: f32 = 0.55;
+/// Lexical floor: a correct answer with weak lexical overlap still keeps this
+/// fraction of its correctness, so a genuine paraphrase isn't wrongly zeroed —
+/// but a lexical mismatch caps the evidence enough to sink a wrong answer once
+/// sharpened. 0.5 balances paraphrase tolerance against wrong-answer rejection.
+const LEX_FLOOR: f32 = 0.4;
+
+/// Combine the raw signals into a sharpened score in [0,1].
+///
+/// `lexical` here is the caller-augmented lexical agreement (BM25 blended with
+/// critical-token match), not raw BM25 alone. `relevance` (cosine to question)
+/// is intentionally unused: it's a weak signal for factual intents and any
+/// additive contribution only compresses the good/bad gap.
 #[inline]
-fn composite(relevance: f32, correctness: f32, lexical: f32, len_quality: f32) -> f32 {
-    let score = W_RELEVANCE   * relevance
-              + W_CORRECTNESS * correctness
-              + W_LEXICAL     * lexical
-              + W_LENGTH      * len_quality;
-    math::clamp01(score)
+fn composite_v3(_relevance: f32, correctness: f32, lexical: f32) -> f32 {
+    let c = math::clamp01(correctness);
+    let l = math::clamp01(lexical);
+
+    // Lexical-gated correctness in raw evidence space. Multiplicative gating is
+    // fine HERE (before sharpening) because the logistic re-expands to the
+    // extremes afterward — the v2 mistake was multiplying the FINAL score.
+    let evidence = c * (LEX_FLOOR + (1.0 - LEX_FLOOR) * l);
+
+    math::sharpen(evidence, SHARPEN_K, SHARPEN_MU)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -160,14 +211,18 @@ pub unsafe extern "C" fn rank_answer(
         return 0.0;
     }
 
-    let (relevance, correctness, lexical, len_quality) =
+    let (relevance, correctness, lexical, len_ratio) =
         compute_signals(question, ground_truth, miner_answer);
 
-    // Gaming-resistant: pull the composite back down when the answer shows
-    // keyword-stuffing / low lexical diversity, so a miner can't inflate BM25
-    // and cosine by spamming ground-truth terms.
-    composite(relevance, correctness, lexical, len_quality)
-        * antigame::stuffing_penalty(miner_answer)
+    // Gaming defence is a HARD gate to 0, applied at the extreme — not a smooth
+    // multiplier. A degenerate answer (empty, padded, single-token spam) scores
+    // exactly 0, which widens separation; everything else flows into the
+    // sharpening composite untouched.
+    if antigame::is_degenerate(miner_answer, len_ratio) {
+        return 0.0;
+    }
+
+    composite_v3(relevance, correctness, lexical)
 }
 
 /// Composite scorer variant for callers that already have `question` and
@@ -214,11 +269,14 @@ pub unsafe extern "C" fn rank_answer_cached(
     let ma_enc = tokenizer::tokenize(miner_answer);
     let ma_vec = embed::run(&ma_enc);
 
-    let (relevance, correctness, lexical, len_quality) =
+    let (relevance, correctness, lexical, len_ratio) =
         signals_from_vecs(q_vec, gt_vec, ground_truth, miner_answer, &ma_vec);
 
-    composite(relevance, correctness, lexical, len_quality)
-        * antigame::stuffing_penalty(miner_answer)
+    if antigame::is_degenerate(miner_answer, len_ratio) {
+        return 0.0;
+    }
+
+    composite_v3(relevance, correctness, lexical)
 }
 
 /// Per-signal breakdown scorer.
@@ -250,16 +308,19 @@ pub unsafe extern "C" fn breakdown_answer(
         return BREAKDOWN_BUF.as_ptr() as i32;
     }
 
-    let (relevance, correctness, lexical, len_quality) =
+    let (relevance, correctness, lexical, len_ratio) =
         compute_signals(question, ground_truth, miner_answer);
 
-    let composite_score = composite(relevance, correctness, lexical, len_quality)
-        * antigame::stuffing_penalty(miner_answer);
+    let composite_score = if antigame::is_degenerate(miner_answer, len_ratio) {
+        0.0
+    } else {
+        composite_v3(relevance, correctness, lexical)
+    };
 
     BREAKDOWN_BUF[IDX_RELEVANCE]   = relevance;
     BREAKDOWN_BUF[IDX_CORRECTNESS] = correctness;
     BREAKDOWN_BUF[IDX_LEXICAL]     = lexical;
-    BREAKDOWN_BUF[IDX_LENGTH]      = len_quality;
+    BREAKDOWN_BUF[IDX_LENGTH]      = len_ratio;
     BREAKDOWN_BUF[IDX_COMPOSITE]   = composite_score;
 
     BREAKDOWN_BUF.as_ptr() as i32
