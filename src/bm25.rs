@@ -51,7 +51,6 @@ pub fn score(query: &str, doc: &str) -> f32 {
     let avg_dl = ((q_terms.len() + d_terms.len()) as f32) / 2.0;
 
     let mut raw = 0.0f32;
-    let mut max_raw = 0.0f32;
 
     for term in &q_terms {
         let tf_val = tf
@@ -64,8 +63,23 @@ pub fn score(query: &str, doc: &str) -> f32 {
         let tf_norm = (tf_val * (K1 + 1.0)) / (tf_val + K1 * (1.0 - B + B * doc_len / avg_dl));
 
         raw += tf_norm;
-        max_raw += K1 + 1.0; // upper bound when TF → ∞
     }
+
+    // Normalise against the ACHIEVABLE per-term maximum, not the tf→∞ bound.
+    //
+    // The upstream baseline normalised by `K1 + 1.0` per term — the limit as
+    // term frequency goes to infinity. No real answer reaches it: a perfect
+    // exact-match answer has tf=1 with doc_len == avg_dl, giving
+    // tf_norm = (K1+1)/(1+K1) = 1.0 per term. Dividing that by K1+1 = 2.5
+    // capped exact matches at 0.4 — so the lexical signal only ever spanned
+    // [0, 0.4] and its 0.15 composite weight effectively contributed at most
+    // 0.06. (The baseline's own `exact_match_scores_high` test asserts > 0.85
+    // and fails at 0.4, confirming the intended range was [0,1].)
+    //
+    // Normalising by 1.0 per query term restores the documented [0,1] range:
+    // exact match → 1.0, no overlap → 0.0, repetition still saturates via K1
+    // and is clamped, so this does not open a stuffing vector.
+    let max_raw = q_terms.len() as f32;
 
     if max_raw == 0.0 {
         return 0.0;

@@ -23,6 +23,7 @@
 extern crate alloc;
 
 mod allocator;
+mod antigame;
 mod bm25;
 mod embed;
 mod math;
@@ -114,10 +115,13 @@ unsafe fn signals_from_vecs(
     miner_answer: &str,
     ma_vec: &[f32],
 ) -> (f32, f32, f32, f32) {
-    let relevance   = math::cosine(q_vec, ma_vec);
+    let relevance = math::cosine(q_vec, ma_vec);
     let correctness = math::cosine(gt_vec, ma_vec);
-    let lexical     = bm25::score(ground_truth, miner_answer);
-    let len_quality = math::sigmoid((miner_answer.len() as f32 - 50.0) / 20.0);
+    let lexical = bm25::score(ground_truth, miner_answer);
+    // Gaming-resistant length: score length RELATIVE to the ground truth
+    // instead of the baseline's absolute sigmoid(len-50), which handed free
+    // points to padded/farmed answers regardless of relevance.
+    let len_quality = antigame::relative_length_quality(ground_truth, miner_answer);
 
     (relevance, correctness, lexical, len_quality)
 }
@@ -159,7 +163,11 @@ pub unsafe extern "C" fn rank_answer(
     let (relevance, correctness, lexical, len_quality) =
         compute_signals(question, ground_truth, miner_answer);
 
+    // Gaming-resistant: pull the composite back down when the answer shows
+    // keyword-stuffing / low lexical diversity, so a miner can't inflate BM25
+    // and cosine by spamming ground-truth terms.
     composite(relevance, correctness, lexical, len_quality)
+        * antigame::stuffing_penalty(miner_answer)
 }
 
 /// Composite scorer variant for callers that already have `question` and
@@ -210,6 +218,7 @@ pub unsafe extern "C" fn rank_answer_cached(
         signals_from_vecs(q_vec, gt_vec, ground_truth, miner_answer, &ma_vec);
 
     composite(relevance, correctness, lexical, len_quality)
+        * antigame::stuffing_penalty(miner_answer)
 }
 
 /// Per-signal breakdown scorer.
@@ -244,7 +253,8 @@ pub unsafe extern "C" fn breakdown_answer(
     let (relevance, correctness, lexical, len_quality) =
         compute_signals(question, ground_truth, miner_answer);
 
-    let composite_score = composite(relevance, correctness, lexical, len_quality);
+    let composite_score = composite(relevance, correctness, lexical, len_quality)
+        * antigame::stuffing_penalty(miner_answer);
 
     BREAKDOWN_BUF[IDX_RELEVANCE]   = relevance;
     BREAKDOWN_BUF[IDX_CORRECTNESS] = correctness;
