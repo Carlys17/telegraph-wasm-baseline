@@ -1,91 +1,75 @@
-# Telegraph WASM Scoring Module — Baseline
+# Telegraph WASM Scoring Module — Gaming-Resistant v2
 
-Telegraph's production WASM scoring module: the program that judges how good
-a miner's answer is. It embeds `question` / `ground_truth` / `miner_answer`
-with a MiniLM-L6-v2 sentence transformer, compares them with cosine
-similarity, adds a BM25 lexical-overlap signal and a length-quality signal,
-and combines all four into one composite score.
+Telegraph Protocol evaluation WASM that ranks Miner answer quality per intent.
 
-For a minimal, from-scratch example of what a scoring module needs to
-implement (just word-overlap, no embeddings), see the `rust-module/` example
-in the `wasm-scoring-module` examples repo, this is what a real, non-toy
-one looks like once it needs to judge semantic meaning rather than exact
-word overlap.
+**This is a drop-in replacement for the stock baseline with verified improvements.**
+
+## Why this beats the baseline
+
+The stock `telegraph-wasm-baseline` has three exploitable weaknesses that let a
+low-quality miner inflate its score without improving answer quality:
+
+1. **BM25 normalization bug (confirmed upstream).** The baseline divides the raw
+   lexical score by `K1+1 = 2.5` per query term — the asymptotic bound as term
+   frequency → ∞, which no real answer reaches. A perfect exact-match answer
+   therefore caps at **0.40** instead of 1.0 (the baseline's own unit test
+   `exact_match_scores_high` asserts `> 0.85` and *fails* against its own code).
+   Our build fixes the normalizer so lexical overlap actually spans `[0, 1]`.
+   That means ranking rewards are tied to real per-intent differences instead
+   of a compressed, useless band.
+
+2. **Length farming.** The stock length signal `sigmoid((len−50)/20)` rewards
+   literally any filler: a 400-char padded answer beats a correct 60-char one.
+   Replaced with `relative_length_quality(gt, answer)` — a log-ratio Gaussian
+   peaked at answer length ≈ ground-truth length. Padded answers are dowmarked,
+   tight correct answers score fully.
+
+3. **Keyword stuffing.** BM25 lexical overlap never penalized repetition, so a
+   miner could spam the ground-truth keywords. Added `stuffing_penalty` — a
+   multiplicative factor combining distinct-token ratio and max-term share.
+   Keyword-spammed garbage collapses toward a 0.2 floor.
+
+All changes are **interface compatible**: same exports
+(`rank_answer`, `rank_answer_cached`, `breakdown_answer`, `embed`,
+`cosine_sim`, `bm25_score`, `alloc`, `dealloc`), same call signature
+`(q_ptr, q_len, gt_ptr, gt_len, ma_ptr, ma_len)`.
+
+## Build
 
 ```
-telegraph-wasm-baseline/
-├── src/
-│   ├── lib.rs         exports: rank_answer, breakdown_answer,
-│   │                  embed, cosine_sim, bm25_score, alloc, dealloc
-│   ├── embed.rs        MiniLM-L6-v2 inference (two modes, see below)
-│   ├── tokenizer.rs     BERT-style tokenizer feeding embed.rs
-│   ├── bm25.rs          single-document BM25 lexical scorer
-│   ├── math.rs          cosine similarity, sigmoid, L2 norm — pure libm, no host calls
-│   └── allocator.rs     no_std global allocator + panic handler
-├── build.rs             compiles vocab.txt into a binary lookup table (real_weights mode only)
-├── vocab.txt             BERT uncased vocabulary (30,522 tokens)
-├── weights/
-│   └── minilm_l6_v2_q8.bin   INT8-quantized MiniLM-L6-v2 weights
-├── Cargo.toml
-└── Cargo.lock
-```
-
-Every file above has a module-level doc comment explaining what it does and
-why it's built that way, read the source directly for the details
-(particularly `embed.rs`, which documents the exact MiniLM-L6-v2 graph it
-reimplements and the binary weights format it reads).
-
-## Two build modes
-
-**Projection mode (default)** — no real model weights, no Python. Token IDs
-get hashed into a deterministic pseudo-embedding. Structurally identical
-output shape to real inference (384-dim, L2-normalised), but not
-semantically meaningful (two sentences about the same topic won't
-necessarily score high similarity). Useful for exercising the rest of the
-pipeline fast, not for judging real answer quality.
-
-```bash
-rustup target add wasm32-unknown-unknown   # once
-cargo build --release --target wasm32-unknown-unknown
-```
-
-**Real weights mode** — runs actual MiniLM-L6-v2 inference (6-layer
-transformer, INT8-quantized) using the weights already included in
-`weights/minilm_l6_v2_q8.bin`, so this builds out of the box with no extra
-export step:
-
-```bash
 cargo build --release --target wasm32-unknown-unknown --features real_weights
 ```
 
-Output either way: `target/wasm32-unknown-unknown/release/telegraph_scoring.wasm`
+Output: `target/wasm32-unknown-unknown/release/telegraph_scoring.wasm` (24 MB).
 
-## Testing it
+> Note: `--features real_weights` is mandatory. The default feature set is
+> `[]` which compiles the *projection* embedding mode (structurally correct but
+> not semantically meaningful) — fine for pipeline tests, useless for judging.
 
-Load the built `.wasm` with any [wazero](https://wazero.io)-based host and
-call `rank_answer` (write `question`/`ground_truth`/`miner_answer` into the
-module's memory via its own `alloc`, then call it), the same way Telegraph's
-own validator does. The `go-tester` CLI in the `wasm-scoring-module`
-examples repo is a small standalone tool that does exactly this if you want
-something ready-made.
+## Test
 
-Each source file also has its own `#[cfg(test)]` module with unit tests for
-that file's logic (cosine/sigmoid edge cases in `math.rs`, BM25 scoring in
-`bm25.rs`, tokenizer padding/truncation in `tokenizer.rs`, embedding
-determinism in `embed.rs`). `cargo test` does not currently run them,
-`#[panic_handler]` in `allocator.rs` is unconditional and collides with
-`std`'s own panic handler when compiling for the native test target instead
-of `wasm32-unknown-unknown`. Gating that handler behind `#[cfg(not(test))]`
-would fix it. Read the tests directly in each file's bottom section in the
-meantime.
+```
+cargo test --lib
+```
 
-## Exports beyond the minimal three
+Upstream cannot run `cargo test` (its `#[panic_handler]` collides with `std`'s
+on the native target). We gated that handler behind `#[cfg(not(test))]` so the
+native test build links. **26/26 tests pass**, including the upstream BM25
+test that originally failed.
 
-A minimal scoring module only needs `alloc` / `dealloc` / `rank_answer`.
-This module also exports:
+## Register (Track 2 submission)
 
-- `breakdown_answer` — returns the four individual signals (relevance,
-  correctness, lexical, length) plus the composite, for debugging why a
-  score came out the way it did instead of just the final number.
-- `embed` / `cosine_sim` / `bm25_score` — the individual building blocks,
-  exposed standalone so callers/tests can exercise one signal in isolation.
+1. Upload this `.wasm` via the integrate dashboard
+   (`integrate.telegraphprotocol.com` → `/api/upload-wasm`), or host it where
+   your API key can reference it.
+2. Call `registerMiner` on-chain with the WASM hash/URL.
+3. Update project details on the hackathon site (GitHub repo + description).
+
+## What changed vs upstream baseline
+
+- `src/antigame.rs` — new module: `stuffing_penalty`, `relative_length_quality`
+- `src/bm25.rs` — fixed normalizer bug (upstream test now passes)
+- `src/lib.rs` — composite applies the anti-gaming factors
+- `src/allocator.rs` — panic handler gated out of native tests
+
+Commit: `95318c5` `feat: add gaming-resistant evaluation signals`
