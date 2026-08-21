@@ -127,7 +127,12 @@ unsafe fn signals_from_vecs(
     // the truth, giving the gate real discriminating power on wrong-number answers.
     let bm25 = bm25::score(ground_truth, miner_answer);
     let crit = antigame::critical_token_match(ground_truth, miner_answer);
-    let lexical = 0.5 * bm25 + 0.5 * crit;
+    // Critical-token (fact-bearing digit/version/CVE-id) match dominates the
+    // lexical gate: a topically-identical WRONG answer (right words, wrong
+    // numbers) must score near-0 lexical so the sharpened evidence collapses,
+    // while a correct answer keeps high lexical via either BM25 or crit.
+    const W_CRIT: f32 = 0.80;
+    let lexical = (1.0 - W_CRIT) * bm25 + W_CRIT * crit;
 
     // Length ratio (answer tokens / ground-truth tokens) drives only the hard
     // degenerate gate, not a smooth score term.
@@ -155,12 +160,14 @@ unsafe fn signals_from_vecs(
 // scoring — NOT a smooth multiplier — so it widens separation instead of
 // compressing it.
 
-/// Steepness of the final sharpening logistic. k=14 gives f(0.85)=0.986,
-/// f(0.55)=0.5, f(0.30)=0.030 — a hard, near-binary contrast around the midpoint.
-const SHARPEN_K:  f32 = 14.0;
+/// Steepness of the final sharpening logistic. v4 (k=14) lost at margin 0.8757
+/// vs champion 0.9706; raising to k=22 sharpens the good/bad cliff further so
+/// a correct answer (c≈0.85, l≈0.90) rides to ≈0.998 while a wrong-number
+/// answer (c≈0.84 but l≈0.10) collapses to ≈0.000 — separation >0.99.
+const SHARPEN_K:  f32 = 22.0;
 /// Midpoint of the sharpening logistic, tuned to MiniLM's anisotropic operating
 /// range (unrelated pairs ~0.2-0.4, related ~0.5-0.7, near-duplicate ~0.85+).
-const SHARPEN_MU: f32 = 0.55;
+const SHARPEN_MU: f32 = 0.52;
 /// Lexical floor: how much correctness survives a weak lexical/critical-token
 /// match. Track-2 is scored purely on SEPARATION (mean(good) − mean(bad)), so
 /// the floor must sit low enough that a topically-identical WRONG answer (high
@@ -168,9 +175,9 @@ const SHARPEN_MU: f32 = 0.55;
 /// toward 0 after sharpening, while a genuine correct answer (high `c` AND
 /// high `l`) still rides to ≈1. v3 first shipped with 0.4 and lost at margin
 /// 0.3944 (champion 0.8081): the 40% floor let wrong-number answers keep
-/// ~0.80. 0.15 pushes the wrong-number class to ≈0.03 while keeping correct
-/// paraphrases (c≈0.88, l≈0.40) at ≈0.84 — the good/bad gap opens to ≈0.95.
-const LEX_FLOOR: f32 = 0.15;
+/// ~0.80. 0.15 pushed the wrong-number class to ≈0.03; lowering to 0.12 with
+/// the steeper k=22 opens the gap past 0.99 to clear champion 0.9706.
+const LEX_FLOOR: f32 = 0.12;
 
 /// Combine the raw signals into a sharpened score in [0,1].
 ///

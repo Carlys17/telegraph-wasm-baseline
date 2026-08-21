@@ -7,9 +7,9 @@
 fn clamp01(v: f32) -> f32 { if v < 0.0 {0.0} else if v > 1.0 {1.0} else {v} }
 fn sharpen(raw: f32, k: f32, mu: f32) -> f32 { clamp01(1.0/(1.0+(-k*(raw-mu)).exp())) }
 
-const K: f32 = 14.0;
-const MU: f32 = 0.55;
-const FLOOR: f32 = 0.15;
+const K: f32 = 22.0;
+const MU: f32 = 0.52;
+const FLOOR: f32 = 0.12;
 
 // v3: lexical-gated correctness then steep sharpen
 fn v3(correctness: f32, lexical: f32) -> f32 {
@@ -23,7 +23,7 @@ fn v2(relevance: f32, correctness: f32, lexical: f32, len_q: f32, penalty: f32) 
 }
 
 fn main() {
-    // (relevance, correctness, lexical=0.5*bm25+0.5*crit, len_q, penalty, class)
+    // (relevance, correctness, lexical=0.2*bm25+0.8*crit, len_q, penalty, class)
     // class: true = good answer, false = bad. Operating points reflect MiniLM
     // anisotropy: good near-duplicate c~0.85-0.95 l~0.85-1.0; wrong-number
     // c~0.75-0.85 (topically identical) l~0.2-0.35 (crit tokens miss);
