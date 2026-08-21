@@ -161,11 +161,16 @@ const SHARPEN_K:  f32 = 14.0;
 /// Midpoint of the sharpening logistic, tuned to MiniLM's anisotropic operating
 /// range (unrelated pairs ~0.2-0.4, related ~0.5-0.7, near-duplicate ~0.85+).
 const SHARPEN_MU: f32 = 0.55;
-/// Lexical floor: a correct answer with weak lexical overlap still keeps this
-/// fraction of its correctness, so a genuine paraphrase isn't wrongly zeroed —
-/// but a lexical mismatch caps the evidence enough to sink a wrong answer once
-/// sharpened. 0.5 balances paraphrase tolerance against wrong-answer rejection.
-const LEX_FLOOR: f32 = 0.4;
+/// Lexical floor: how much correctness survives a weak lexical/critical-token
+/// match. Track-2 is scored purely on SEPARATION (mean(good) − mean(bad)), so
+/// the floor must sit low enough that a topically-identical WRONG answer (high
+/// cosine `c` ≈ 0.82 but missed critical tokens → low `l` ≈ 0.25) collapses
+/// toward 0 after sharpening, while a genuine correct answer (high `c` AND
+/// high `l`) still rides to ≈1. v3 first shipped with 0.4 and lost at margin
+/// 0.3944 (champion 0.8081): the 40% floor let wrong-number answers keep
+/// ~0.80. 0.15 pushes the wrong-number class to ≈0.03 while keeping correct
+/// paraphrases (c≈0.88, l≈0.40) at ≈0.84 — the good/bad gap opens to ≈0.95.
+const LEX_FLOOR: f32 = 0.15;
 
 /// Combine the raw signals into a sharpened score in [0,1].
 ///

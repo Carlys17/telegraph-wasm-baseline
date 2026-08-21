@@ -9,7 +9,7 @@ fn sharpen(raw: f32, k: f32, mu: f32) -> f32 { clamp01(1.0/(1.0+(-k*(raw-mu)).ex
 
 const K: f32 = 14.0;
 const MU: f32 = 0.55;
-const FLOOR: f32 = 0.5;
+const FLOOR: f32 = 0.15;
 
 // v3: lexical-gated correctness then steep sharpen
 fn v3(correctness: f32, lexical: f32) -> f32 {
