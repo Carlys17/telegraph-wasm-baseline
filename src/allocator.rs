@@ -9,9 +9,9 @@ use dlmalloc::GlobalDlmalloc;
 static ALLOCATOR: GlobalDlmalloc = GlobalDlmalloc;
 
 /// Panic handler — required for `no_std`.
-/// WASM traps on `unreachable`, which surfaces as a wazero error in Go.
-/// Gated out of the native test target, where `std` supplies its own panic
-/// handler; without this gate `cargo test` fails to link (duplicate lang item).
+/// Uses `unreachable_unchecked` which is safe under `panic = "abort"` profile.
+/// On WASM this traps as unreachable; on native it's a no-op (the abort
+/// profile terminates the process on actual panic before reaching here).
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
