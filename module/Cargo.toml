@@ -1,0 +1,19 @@
+[package]
+name = "telegraph-scorer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "telegraph_scorer"
+crate-type = ["cdylib"]
+
+[features]
+# CHAT_COMPLETION build only: compiles minilm.rs and embeds the 23 MB transformer blob.
+# The lexical CVE_LOOKUP build omits it entirely (W_EMB = 0).
+minilm = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
