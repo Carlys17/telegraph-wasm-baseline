@@ -7,13 +7,18 @@ edition = "2021"
 # cargo build --target wasm32-unknown-unknown --release
 # Output: target/wasm32-unknown-unknown/release/telegraph_scoring.wasm
 [lib]
-crate-type = ["cdylib"]
+# rlib is needed so native integration tests (tests/realbench.rs) can link the
+# crate and measure real signal values; the WASM artifact only uses cdylib.
+crate-type = ["cdylib", "rlib"]
 
 # ── Features ──────────────────────────────────────────────────────────────────
 [features]
 default = []
 # Activate once you have run scripts/export_minilm_weights.py
 real_weights = []
+# Expose internal scoring primitives for the native measurement harness
+# (tests/realbench.rs). Never enabled for release WASM builds.
+bench = []
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 [dependencies]
@@ -32,3 +37,9 @@ strip         = true
 
 [profile.dev]
 panic         = "abort"
+
+# Native measurement harness: runs as a plain binary (fn main), not the
+# default #[test] harness, so it prints the full signal table.
+[[test]]
+name = "realbench"
+harness = false

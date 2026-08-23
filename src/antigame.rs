@@ -92,17 +92,147 @@ fn numeric_equal(a: &str, b: &str) -> bool {
     parse_decimal_milli(a).is_some_and(|ma| parse_decimal_milli(b).is_some_and(|mb| ma == mb))
 }
 
-/// Extract CVE patterns from text and canonicalize: CVE-YYYY-NNNN (zero-padded 4 digits).
-/// Handles both "CVE-YYYY-NNNN" and "CVEYYYYNNNN" formats.
-fn extract_cves(text: &str) -> Vec<String> {
+/// Anchor STEMS indicating a nearby numeric token is a "fact unit". Stems so
+/// "score"/"scores"/"scoring" all match "scor", "version"/"versions" match
+/// "vers", etc.
+const ANCHOR_STEMS: &[&str] = &["cvss", "scor", "epss", "port", "vers", "sever", "base"];
+
+/// Score-family stems: GT "base score of 9.8" and answer "CVSS 9.8" name the
+/// same fact with different anchor words, so when the GT fact's anchor is one
+/// of these, the answer's values are collected near ANY of them.
+const SCORE_STEMS: &[&str] = &["cvss", "scor", "epss", "base"];
+
+/// Weight per ground-truth CVE id.
+const W_CVE: f32 = 1.0;
+/// Weight per anchored numeric fact — the numbers that carry the truth
+/// (CVSS score, version, port...). Dominates the crit signal on purpose:
+/// CVE_LOOKUP answers live or die by their numbers.
+const W_ANCHORED: f32 = 3.0;
+/// Weight per bare numeric token (year, count, ...) with no anchor nearby.
+const W_BARE: f32 = 0.3;
+/// Weight per version number ("v3.1", "SMBv1"). Versions are secondary facts;
+/// they never trigger a conflict penalty (a correct answer that says
+/// "CVSS 10.0" next to "CVSS v3.1" must not be punished for the 3.1).
+const W_VERSION: f32 = 0.5;
+/// How many bytes around a number/anchor we scan for the (number, anchor)
+/// association, in raw text.
+const FACT_WINDOW: usize = 40;
+
+/// Small number words accepted as numeric values (answers sometimes spell
+/// scores out: "a score of ten"). Milli units (value × 1000).
+const WORD_NUMBERS: &[(&str, i32)] = &[
+    ("zero", 0),
+    ("one", 1_000),
+    ("two", 2_000),
+    ("three", 3_000),
+    ("four", 4_000),
+    ("five", 5_000),
+    ("six", 6_000),
+    ("seven", 7_000),
+    ("eight", 8_000),
+    ("nine", 9_000),
+    ("ten", 10_000),
+];
+
+/// Snap a byte offset to a char boundary (floor) so slicing never panics.
+fn snap(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Extract decimal numbers from raw text WITH byte spans:
+/// (milli value, start, end, is_version). Operates on raw text, not the
+/// alphanumeric tokeniser — that one destroys decimals ("7.5" → "7","5",
+/// dropped by the len>=2 filter), which was the v6 bug that let wrong-score
+/// answers score crit=1.0.
+///
+/// `is_version` = the digit run is immediately preceded by 'v'/'V'
+/// ("v3.1", "SMBv1"). Version digits are secondary facts, weighted low, and
+/// never conflict-penalised.
+fn extract_numbers_raw(text: &str) -> Vec<(i32, usize, usize, bool)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            let mut seen_dot = false;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_digit()
+                    || (bytes[i] == b'.'
+                        && !seen_dot
+                        && i + 1 < bytes.len()
+                        && bytes[i + 1].is_ascii_digit()))
+            {
+                if bytes[i] == b'.' {
+                    seen_dot = true;
+                }
+                i += 1;
+            }
+            if i > start {
+                if let Some(milli) = parse_decimal_milli(&text[start..i]) {
+                    let is_version = start > 0
+                        && (bytes[start - 1] == b'v' || bytes[start - 1] == b'V');
+                    out.push((milli, start, i, is_version));
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Number words ("ten", "seven"...) as (milli, start, end), whole-word only.
+fn word_numbers(text: &str) -> Vec<(i32, usize, usize)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    for (word, milli) in WORD_NUMBERS {
+        let wl = word.len();
+        let mut i = 0;
+        while i + wl <= bytes.len() {
+            let mut found = false;
+            if let Some(slice) = text.get(i..i + wl) {
+                if slice.eq_ignore_ascii_case(word) {
+                    let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                    let after_ok = i + wl == bytes.len() || !bytes[i + wl].is_ascii_alphanumeric();
+                    if before_ok && after_ok {
+                        out.push((*milli, i, i + wl));
+                        found = true;
+                    }
+                }
+            }
+            i += if found { wl } else { 1 };
+        }
+    }
+    out
+}
+
+/// All numeric values in text: digit runs (with version flag) + number words.
+fn all_numbers(text: &str) -> Vec<(i32, usize, usize, bool)> {
+    let mut v = extract_numbers_raw(text);
+    for (m, s, e) in word_numbers(text) {
+        v.push((m, s, e, false));
+    }
+    v.sort_by_key(|t| t.1);
+    v
+}
+
+/// Extract CVE ids with byte spans: (canonical id, span_start, span_end).
+fn extract_cve_spans(text: &str) -> Vec<(String, usize, usize)> {
     let mut cves = Vec::new();
     let upper = text.to_ascii_uppercase();
     let mut search_start = 0;
     while let Some(idx) = upper[search_start..].find("CVE") {
         let abs_idx = search_start + idx;
         let after_cve = &upper[abs_idx + 3..];
-        // Check if next char is '-' or digit (start of year)
-        let rest = if after_cve.starts_with('-') {
+        let dash = after_cve.starts_with('-');
+        let rest = if dash {
             &after_cve[1..]
         } else if after_cve.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             after_cve
@@ -110,14 +240,12 @@ fn extract_cves(text: &str) -> Vec<String> {
             search_start = abs_idx + 4;
             continue;
         };
-        // Match exactly 4 digits for year
         if rest.len() < 4 || !rest[..4].chars().all(|c| c.is_ascii_digit()) {
             search_start = abs_idx + 4;
             continue;
         }
         let year = &rest[..4];
         let after_year = &rest[4..];
-        // Skip optional dash
         let num_start = if after_year.starts_with('-') { 1 } else { 0 };
         let mut num_end = num_start;
         for (i, ch) in after_year[num_start..].char_indices() {
@@ -143,7 +271,9 @@ fn extract_cves(text: &str) -> Vec<String> {
                 canonical.push_str(&year_digits);
                 canonical.push('-');
                 canonical.push_str(&num_padded);
-                cves.push(canonical);
+                let rest_abs = abs_idx + 3 + if dash { 1 } else { 0 };
+                let end_abs = rest_abs + 4 + num_end;
+                cves.push((canonical, abs_idx, end_abs));
             }
         }
         search_start = abs_idx + 4;
@@ -153,95 +283,154 @@ fn extract_cves(text: &str) -> Vec<String> {
 
 /// Check if ground-truth CVEs are present in answer.
 fn cve_match_score(ground_truth: &str, answer: &str) -> (f32, f32) {
-    let gt_cves = extract_cves(ground_truth);
+    let gt_cves = extract_cve_spans(ground_truth);
     if gt_cves.is_empty() {
         return (0.0, 0.0); // no CVEs in ground truth, neutral
     }
-    let ans_cves = extract_cves(answer);
+    let ans_cves: Vec<String> = extract_cve_spans(answer).into_iter().map(|(c, _, _)| c).collect();
     let mut hits = 0;
-    for cve in &gt_cves {
-        if ans_cves.iter().any(|a| a == cve) {
+    for (c, _, _) in &gt_cves {
+        if ans_cves.iter().any(|a| a == c) {
             hits += 1;
         }
     }
     (hits as f32 / gt_cves.len() as f32, gt_cves.len() as f32)
 }
 
-/// Anchor keywords that indicate a numeric token is a "fact unit".
-const ANCHORS: &[&str] = &["cvss", "cve", "version", "score", "epss", "port", "year", "severity"];
-
-/// Extract fact units from ground truth: (anchor_or_none, numeric_string)
-/// Each unit combines a numeric token with its nearest preceding anchor keyword.
-fn extract_fact_units(tokens: &[String]) -> Vec<(Option<String>, String)> {
-    let mut units = Vec::new();
-    for (i, tok) in tokens.iter().enumerate() {
-        // Check if token contains digit
-        if tok.chars().any(|c| c.is_ascii_digit()) {
-            // Look for anchor in preceding tokens (window 2)
-            let mut anchor = None;
-            for w in 1..=2 {
-                if i >= w {
-                    let prev = &tokens[i - w];
-                    if ANCHORS.iter().any(|a| prev.contains(a)) {
-                        anchor = Some(prev.clone());
-                        break;
-                    }
-                }
-            }
-            units.push((anchor, tok.clone()));
-        }
-    }
-    units
-}
-
-/// Critical-token match upgraded to fact-unit matching with numeric fuzzy and CVE normalization.
-/// Returns score in [0,1]: weighted fraction of ground-truth fact units matched in answer.
-/// CVE units weigh 2.0, units with anchor keyword weigh 1.0, bare numeric tokens weigh 0.3.
+/// Critical-token match v2: raw-text fact-unit matching with numeric fuzzy
+/// equality, CVE normalization, and CONFLICT PENALTY.
+///
+/// Returns score in [0,1]: weighted fraction of ground-truth fact units the
+/// answer gets right, minus penalties for actively contradicting a fact
+/// (e.g. GT "score of 7.5" vs answer "score of 9.8" near the same anchor
+/// subtracts instead of merely missing). This is what separates a
+/// topically-identical WRONG answer from a correct one: cosine and BM25 can't
+/// tell 7.5 from 9.8, this signal can.
+///
+/// Weights: CVE id 1.0, anchored number 3.0, bare number 0.3.
 pub fn critical_token_match(ground_truth: &str, answer: &str) -> f32 {
-    let gt_tokens = tokenise(ground_truth);
-    let ans_tokens = tokenise(answer);
-    let ans_set: alloc::collections::BTreeSet<_> = ans_tokens.iter().cloned().collect();
+    let lower_gt = ground_truth.to_lowercase();
+    let lower_ans = answer.to_lowercase();
 
-    // CVE matching on raw text (not tokenized)
-    let (cve_score, cve_count) = cve_match_score(ground_truth, answer);
-
-    // Fact-unit extraction from tokens (for non-CVE numeric facts)
-    let gt_units = extract_fact_units(&gt_tokens);
+    let gt_cve_spans = extract_cve_spans(ground_truth);
+    let ans_cves: Vec<String> = extract_cve_spans(answer).into_iter().map(|(c, _, _)| c).collect();
 
     let mut total_weight = 0.0f32;
     let mut matched_weight = 0.0f32;
 
-    // Add CVE weight
-    if cve_count > 0.0 {
-        total_weight += cve_count * 2.0;
-        matched_weight += cve_score * cve_count * 2.0;
+    // ── CVE ids ──────────────────────────────────────────────────────────────
+    // For CVE_LOOKUP the CVE id is already in the QUESTION, so a correct
+    // answer may legitimately omit it. The id only becomes a scored fact when
+    // the answer cites a CVE: right id = credit, wrong id = penalty.
+    if !gt_cve_spans.is_empty() && !ans_cves.is_empty() {
+        let mut hits = 0usize;
+        for (c, _, _) in &gt_cve_spans {
+            if ans_cves.iter().any(|a| a == c) {
+                hits += 1;
+            }
+        }
+        total_weight += gt_cve_spans.len() as f32 * W_CVE;
+        matched_weight += hits as f32 * W_CVE;
+        // Answer cites a CVE but none of the ground truth's: actively wrong id.
+        if hits == 0 {
+            matched_weight -= W_CVE;
+        }
     }
 
-    for (anchor, num_tok) in gt_units {
-        // Skip if this token is part of a CVE (already handled above)
-        if num_tok.to_ascii_uppercase().starts_with("CVE") {
+    // ── Numeric facts (raw text, decimals + number words preserved) ─────────
+    let gt_numbers = all_numbers(ground_truth);
+    let ans_numbers = all_numbers(answer);
+
+    for (milli, start, end, is_version) in &gt_numbers {
+        // Digits inside a CVE id are handled by the CVE branch above.
+        if gt_cve_spans.iter().any(|(_, cs, ce)| *start >= *cs && *end <= *ce) {
             continue;
         }
-        let weight = if anchor.is_some() { 1.0 } else { 0.3 };
-        total_weight += weight;
 
-        let mut hit = false;
-        if let Some(anchor_kw) = anchor {
-            // Fact unit: need anchor present AND numeric value match
-            // Anchor is a substring match (e.g. "score" matches "scores", "cvss" matches "cvss3")
-            let anchor_hit = ans_set.iter().any(|a| a.contains(anchor_kw.as_str()));
-            let num_hit = ans_set.iter().any(|a| numeric_equal(a, &num_tok));
-            if anchor_hit && num_hit {
-                hit = true;
+        // Version numbers ("v3.1", "SMBv1"): low weight, match-only, never
+        // conflict-penalised — a correct answer that omits or rephrases the
+        // version must not be punished.
+        if *is_version {
+            total_weight += W_VERSION;
+            if ans_numbers.iter().any(|(m, _, _, _)| m == milli) {
+                matched_weight += W_VERSION;
             }
-        } else {
-            // Bare numeric token: fuzzy numeric match
-            if ans_set.iter().any(|a| numeric_equal(a, &num_tok)) {
-                hit = true;
+            continue;
+        }
+
+        // Nearest anchor stem within FACT_WINDOW bytes BEFORE or AFTER the
+        // number (answers say both "CVSS 10.0" and "10.0 CVSS").
+        let win_start = snap(&lower_gt, start.saturating_sub(FACT_WINDOW));
+        let win_end = snap(&lower_gt, (*end + FACT_WINDOW).min(lower_gt.len()));
+        let window = &lower_gt[win_start..win_end];
+        let num_rel = *start - win_start;
+        let num_len = *end - *start;
+        let mut anchor: Option<&'static str> = None;
+        let mut best_dist = usize::MAX;
+        for stem in ANCHOR_STEMS {
+            let mut search = 0usize;
+            while search < window.len() {
+                let rel = match window[search..].find(stem) {
+                    Some(p) => p,
+                    None => break,
+                };
+                let occ = search + rel;
+                let dist = if occ + stem.len() <= num_rel {
+                    num_rel - (occ + stem.len())
+                } else if occ >= num_rel + num_len {
+                    occ - (num_rel + num_len)
+                } else {
+                    0
+                };
+                if dist < best_dist {
+                    best_dist = dist;
+                    anchor = Some(stem);
+                }
+                search = occ + stem.len();
             }
         }
-        if hit {
-            matched_weight += weight;
+
+        if let Some(stem) = anchor {
+            total_weight += W_ANCHORED;
+            // Values the answer states near the SAME anchor stem (either side).
+            // Score-family anchors are interchangeable: GT "base score of 9.8"
+            // vs answer "CVSS 9.8" is the same fact.
+            let stems: &[&str] = if SCORE_STEMS.contains(&stem) {
+                SCORE_STEMS
+            } else {
+                core::slice::from_ref(&stem)
+            };
+            let mut values: Vec<i32> = Vec::new();
+            for st in stems {
+                let mut search = 0usize;
+                while search < lower_ans.len() {
+                    let rel = match lower_ans[search..].find(st) {
+                        Some(p) => p,
+                        None => break,
+                    };
+                    let occ_start = search + rel;
+                    let occ_end = occ_start + st.len();
+                    let lo = snap(&lower_ans, occ_start.saturating_sub(FACT_WINDOW));
+                    let hi = snap(&lower_ans, (occ_end + FACT_WINDOW).min(lower_ans.len()));
+                    for (m, ns, _, _) in &ans_numbers {
+                        if *ns >= lo && *ns < hi {
+                            values.push(*m);
+                        }
+                    }
+                    search = occ_end;
+                }
+            }
+            if values.iter().any(|v| v == milli) {
+                matched_weight += W_ANCHORED;
+            } else if !values.is_empty() {
+                // Conflicting value next to the same anchor: worse than silence.
+                matched_weight -= W_ANCHORED;
+            }
+        } else {
+            total_weight += W_BARE;
+            if ans_numbers.iter().any(|(m, _, _, _)| m == milli) {
+                matched_weight += W_BARE;
+            }
         }
     }
 
@@ -249,7 +438,7 @@ pub fn critical_token_match(ground_truth: &str, answer: &str) -> f32 {
         return 1.0; // neutral, no fact-bearing tokens
     }
 
-    matched_weight / total_weight
+    (matched_weight / total_weight).clamp(0.0, 1.0)
 }
 
 /// Distinct-token ratio: unique terms / total terms in the answer. Used only by
