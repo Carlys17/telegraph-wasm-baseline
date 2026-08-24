@@ -62,29 +62,20 @@ const M_NUM_CRUSH: f32 = 0.02;
 /// for a right verdict. This is what lifts a correct numeric paraphrase ("roughly
 /// $3,120 per ETH" for "3,120 USD") from mid-range word-overlap up to near-perfect,
 /// which is where the FINANCIAL_DATA champion separates and our lexical build did not.
-const M_NUM_MATCH: f32 = 0.6;
+const M_NUM_MATCH: f32 = 0.38;
 /// Same words, no shared adjacency.
 const M_ORDER: f32 = 0.55;
 /// A figure attached to a different entity. Harder than a plain reordering, because
 /// "Base at 2.6 billion" when the truth is "Arbitrum at 2.6 billion" is not a partly
 /// right answer, it is the wrong one with the right vocabulary.
 const M_ENTITY: f32 = 0.3;
-/// Two different proper-noun names for the same slot (Heartbleed vs Spectre,
-/// Log4j vs Commons Text). The figure-entity check above only catches number
-/// mismatches; this catches the name-only case.
-const M_NAME_MISMATCH: f32 = 0.1;
-/// Stem hashes of the attack-vector antonym pair: "remote" (remotely stems to it)
-/// and "physical". An answer that flips the access vector asserts the opposite of
-/// the ground truth, so it is crushed like a contradiction, not discounted.
-const REMOTE_STEM: u32 = 0xc78d_7953;
-const PHYSICAL_STEM: u32 = 0x8619_3260;
 /// How much of the score a negated match costs. "No rain is expected" covers every
 /// content word of "rain is expected" and asserts the opposite, so coverage that only
 /// holds under a negation the ground truth does not carry is worth less than nothing.
 const M_NEGCOV: f32 = 1.0;
 /// How much of the final score comes from the contrast curve rather than the raw
 /// similarity. All contrast sharpens separation, all raw ranks more smoothly.
-const SHARPEN: f32 = 0.95;
+const SHARPEN: f32 = 0.82;
 /// Semantic credit: what a vector match is worth next to an exact one, the cosine
 /// below which a match is mere topicality rather than a paraphrase, and the share of
 /// the answer-bearing content that vectors alone are allowed to satisfy. That last
@@ -109,6 +100,18 @@ fn soft_credit(sim: f32) -> f32 {
     let t = (sim - SOFT_MIN) / (1.0 - SOFT_MIN);
     SOFT_W * t * t
 }
+
+/// Extra monotonic contrast after SHARPEN: whole smoothstep passes that preserve
+/// the ranking while widening good-vs-bad separation. 0 keeps the module unchanged.
+const POST_ITERS: u32 = 3;
+/// Rescale so POST_PIVOT maps to 0.5 before the passes; answers above the pivot
+/// are lifted, only those below it are crushed. 0.5 = no-op (midpoint already).
+const POST_PIVOT: f32 = 0.5;
+/// Fractional final smoothstep pass (0..1) for fine control between integer counts.
+const POST_FRAC: f32 = 0.0;
+
+fn smoothstep(x: f32) -> f32 { x * x * (3.0 - 2.0 * x) }
+
 
 // ---------------------------------------------------------------------------
 // Word vectors
@@ -560,10 +563,6 @@ struct Toks {
     cap: [bool; MAX_TOKENS],
     /// First four lowercased letters, packed like an acronym key.
     pre: [u32; MAX_TOKENS],
-    /// Token contains at least one ASCII digit. Lets the name-swap check treat
-    /// versioned product names (Log4j2) as names while skipping pure-letter
-    /// abbreviations (EoP, RCE).
-    has_digit: [bool; MAX_TOKENS],
     /// Parsed magnitude of a figure token (mantissa times any scale), 0 when the
     /// token is not a figure. Used for value-based figure matching (relative error)
     /// so "3.1T", "3.1 trillion" and "$3,100,000,000,000" all compare equal.
@@ -586,7 +585,6 @@ const EMPTY_TOKS: Toks = Toks {
     proper: [false; MAX_TOKENS],
     cap: [false; MAX_TOKENS],
     pre: [0; MAX_TOKENS],
-    has_digit: [false; MAX_TOKENS],
     val: [0.0; MAX_TOKENS],
 };
 
@@ -650,29 +648,6 @@ fn acronym_key(tok: &[u8]) -> u32 {
         i += 1;
     }
     key
-}
-
-/// Count of leading alphabetic bytes. Used to keep short abbreviations (EoP, RCE)
-/// out of the name-swap check: only tokens with at least 4 leading letters are
-/// treated as comparable entity names.
-fn alpha_prefix_len(tok: &[u8]) -> usize {
-    let mut i = 0;
-    while i < tok.len() && is_alpha(tok[i]) {
-        i += 1;
-    }
-    i
-}
-
-/// Number of leading-alpha letters packed into a prefix_key value (0..=4).
-fn pre_len(pre: u32) -> usize {
-    let mut c = 0usize;
-    let mut i = 0;
-    while i < 4 {
-        if ((pre >> (8 * i)) & 0xff) == 0 { break; }
-        c += 1;
-        i += 1;
-    }
-    c
 }
 
 /// First four letters of a token, packed like an acronym key so a country code can
@@ -806,15 +781,6 @@ fn tokenize(src: &[u8], t: &mut Toks) {
         t.proper[k] = proper;
         t.cap[k] = has_alpha && tok[0].is_ascii_uppercase();
         t.pre[k] = prefix_key(tok);
-        {
-            let mut d = false;
-            let mut di = 0;
-            while di < tok.len() {
-                if tok[di].is_ascii_digit() { d = true; break; }
-                di += 1;
-            }
-            t.has_digit[k] = d;
-        }
         // Figure value for relative-error matching. Use the ORIGINAL word hash for
         // the scale, because a scale word ("trillion") has already been rewritten to
         // a digit-string hash above and would otherwise read as scale 0. A digit-
@@ -1550,99 +1516,6 @@ fn score(q: &[u8], gt: &[u8], ma: &[u8]) -> f32 {
             }
         }
 
-        // Name-only substitution: the ground truth names one entity (Log4j2) and the
-        // answer names a different one (Commons Text), with no figure to mismatch on.
-        // A different name is a different answer, not a paraphrase, so crush it even
-        // when the rest of the vocabulary overlaps. Only non-acronym proper nouns are
-        // compared: acronyms (SMB, EoP, RCE) abbreviate words already present and
-        // matching them reliably is out of scope here. Two names count as the same
-        // entity when their stems match or their first four letters match, so
-        // "Log4j2" and "Log4j" (or an alias sharing a prefix) are not treated as a
-        // swap, and a pure omission or a pure alias addition does not fire either.
-        {
-            let mut g_names: [u32; 16] = [0; 16];
-            let mut g_pre: [u32; 16] = [0; 16];
-            let mut a_names: [u32; 16] = [0; 16];
-            let mut a_pre: [u32; 16] = [0; 16];
-            let mut gn = 0usize;
-            let mut an = 0usize;
-            let mut i = 0usize;
-            while i < tg.n && gn < 16 {
-                if tg.proper[i] && tg.acro[i] == 0 && tg.stem[i] > 0 && tg.stem[i] != CVE_STEM
-                    && (tg.has_digit[i] || pre_len(tg.pre[i]) >= 4) {
-                    g_names[gn] = tg.stem[i]; g_pre[gn] = tg.pre[i]; gn += 1;
-                }
-                i += 1;
-            }
-            i = 0;
-            while i < ta.n && an < 16 {
-                if ta.proper[i] && ta.acro[i] == 0 && ta.stem[i] > 0 && ta.stem[i] != CVE_STEM
-                    && (ta.has_digit[i] || pre_len(ta.pre[i]) >= 4) {
-                    a_names[an] = ta.stem[i]; a_pre[an] = ta.pre[i]; an += 1;
-                }
-                i += 1;
-            }
-            if gn > 0 && an > 0 {
-                let mut gt_only = 0usize;
-                let mut ans_only = 0usize;
-                let mut gx = 0usize;
-                while gx < gn {
-                    let mut found = false;
-                    let mut ax = 0usize;
-                    while ax < an {
-                        if g_names[gx] == a_names[ax]
-                            || (g_pre[gx] != 0 && g_pre[gx] == a_pre[ax]) { found = true; break; }
-                        ax += 1;
-                    }
-                    if !found { gt_only += 1; }
-                    gx += 1;
-                }
-                let mut ax = 0usize;
-                while ax < an {
-                    let mut found = false;
-                    let mut gx = 0usize;
-                    while gx < gn {
-                        if a_names[ax] == g_names[gx]
-                            || (a_pre[ax] != 0 && a_pre[ax] == g_pre[gx]) { found = true; break; }
-                        gx += 1;
-                    }
-                    if !found { ans_only += 1; }
-                    ax += 1;
-                }
-                if gt_only > 0 && ans_only > 0 {
-                    raw *= M_NAME_MISMATCH;
-                    claim_wrong = true;
-                }
-            }
-        }
-
-        // Attack-vector flip: the ground truth says the exploit is remote and the
-        // answer says it needs physical access (or vice versa). That is asserting
-        // the opposite of a stated fact, so crush it the way a contradiction is
-        // crushed rather than letting the shared vocabulary carry the score.
-        {
-            let mut g_remote = false;
-            let mut g_phys = false;
-            let mut a_remote = false;
-            let mut a_phys = false;
-            let mut i = 0usize;
-            while i < tg.n {
-                if tg.stem[i] == REMOTE_STEM { g_remote = true; }
-                if tg.stem[i] == PHYSICAL_STEM { g_phys = true; }
-                i += 1;
-            }
-            i = 0;
-            while i < ta.n {
-                if ta.stem[i] == REMOTE_STEM { a_remote = true; }
-                if ta.stem[i] == PHYSICAL_STEM { a_phys = true; }
-                i += 1;
-            }
-            if (g_remote && a_phys && !a_remote) || (g_phys && a_remote && !a_phys) {
-                raw *= M_NAME_MISMATCH;
-                claim_wrong = true;
-            }
-        }
-
         // Coverage that only holds under a negation the ground truth does not carry.
         if contra_w > 0.0 && k_tot > 0.0 {
             let ratio = clamp01(contra_w / k_tot);
@@ -1834,8 +1707,28 @@ fn score(q: &[u8], gt: &[u8], ma: &[u8]) -> f32 {
         // flattening the middle: a scorer whose outputs barely vary is rejected,
         // and one that is all-or-nothing cannot rank the answers in between.
         let raw = clamp01(raw);
-        let smooth = raw * raw * (3.0 - 2.0 * raw);
-        clamp01(SHARPEN * smooth + (1.0 - SHARPEN) * raw)
+        let mut out = clamp01(SHARPEN * smoothstep(raw) + (1.0 - SHARPEN) * raw);
+        // Extra monotonic contrast: preserves the ranking while widening good-vs-bad
+        // separation. Off (0) for every build that does not ask for it.
+        if POST_ITERS > 0 {
+            if POST_PIVOT > 0.0 && POST_PIVOT < 1.0 && (POST_PIVOT - 0.5).abs() > 1e-6 {
+                out = if out <= POST_PIVOT {
+                    0.5 * out / POST_PIVOT
+                } else {
+                    0.5 + 0.5 * (out - POST_PIVOT) / (1.0 - POST_PIVOT)
+                };
+            }
+            let mut it = 0u32;
+            while it < POST_ITERS {
+                out = smoothstep(out);
+                it += 1;
+            }
+            if POST_FRAC > 0.0 {
+                let s = smoothstep(out);
+                out = out + POST_FRAC * (s - out);
+            }
+        }
+        clamp01(out)
     }
 }
 
