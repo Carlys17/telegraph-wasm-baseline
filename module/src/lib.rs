@@ -62,7 +62,7 @@ const M_NUM_CRUSH: f32 = 0.02;
 /// for a right verdict. This is what lifts a correct numeric paraphrase ("roughly
 /// $3,120 per ETH" for "3,120 USD") from mid-range word-overlap up to near-perfect,
 /// which is where the FINANCIAL_DATA champion separates and our lexical build did not.
-const M_NUM_MATCH: f32 = 0.38;
+const M_NUM_MATCH: f32 = 0.50;
 /// Same words, no shared adjacency.
 const M_ORDER: f32 = 0.55;
 /// A figure attached to a different entity. Harder than a plain reordering, because
