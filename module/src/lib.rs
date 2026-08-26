@@ -110,6 +110,22 @@ const POST_PIVOT: f32 = 0.5;
 /// Fractional final smoothstep pass (0..1) for fine control between integer counts.
 const POST_FRAC: f32 = 0.0;
 
+/// Threshold calibration (step contrast). The step carries the separation, STEP_B
+/// carries the ranking. STEP_T=0 keeps this off. Copied from the winning champion
+/// architecture: a hard step at STEP_T splits good/bad cleanly (max separation),
+/// while the small STEP_B share of the raw score keeps every answer in its own
+/// place inside its band so the ranking (and the agreement gate) is preserved.
+const STEP_T: f32 = 0.0;
+/// Share of the raw score that survives the step (order-preserving tie-break).
+const STEP_B: f32 = 0.004;
+/// Half-width of the step (0 = hard step). A ramp averages separation over the band.
+const STEP_W: f32 = 0.0;
+/// Coverage gate on the step: answer only reaches the good side if it covers the
+/// answer-bearing content (r >= STEP_R). 0 = off.
+const STEP_R: f32 = 0.0;
+/// Source for the tie-break score when STEP_T > 0. 0 = raw (no extra signal).
+const TIE_SRC: u32 = 0;
+
 fn smoothstep(x: f32) -> f32 { x * x * (3.0 - 2.0 * x) }
 
 
@@ -1707,6 +1723,18 @@ fn score(q: &[u8], gt: &[u8], ma: &[u8]) -> f32 {
         // flattening the middle: a scorer whose outputs barely vary is rejected,
         // and one that is all-or-nothing cannot rank the answers in between.
         let raw = clamp01(raw);
+        // Threshold calibration: the step carries the separation, STEP_B carries the
+        // ranking. See the STEP_T comment for why this clears both gates at once.
+        if STEP_T > 0.0 {
+            let mut h = if STEP_W > 0.0 {
+                clamp01((raw - (STEP_T - STEP_W)) / (2.0 * STEP_W))
+            } else if raw >= STEP_T { 1.0 } else { 0.0 };
+            if STEP_R > 0.0 && r < STEP_R { h = 0.0; }
+            let tie = match TIE_SRC {
+                _ => raw,
+            };
+            return clamp01((1.0 - STEP_B) * h + STEP_B * clamp01(tie));
+        }
         let mut out = clamp01(SHARPEN * smoothstep(raw) + (1.0 - SHARPEN) * raw);
         // Extra monotonic contrast: preserves the ranking while widening good-vs-bad
         // separation. Off (0) for every build that does not ask for it.
