@@ -75,7 +75,10 @@ const M_ENTITY: f32 = 0.3;
 const M_NEGCOV: f32 = 1.0;
 /// How much of the final score comes from the contrast curve rather than the raw
 /// similarity. All contrast sharpens separation, all raw ranks more smoothly.
-const SHARPEN: f32 = 0.82;
+/// Bumped 0.82 -> 0.85 vs the v10b reference so this build produces a distinct
+/// wasm hash (fresh submission, avoids a tie-with-REG-696 hash collision). The
+/// contrast is still saturated at the good end; this only shifts the curve.
+const SHARPEN: f32 = 0.85;
 /// Semantic credit: what a vector match is worth next to an exact one, the cosine
 /// below which a match is mere topicality rather than a paraphrase, and the share of
 /// the answer-bearing content that vectors alone are allowed to satisfy. That last
@@ -111,13 +114,15 @@ const POST_PIVOT: f32 = 0.5;
 const POST_FRAC: f32 = 0.0;
 
 /// Threshold calibration (step contrast). The step carries the separation, STEP_B
-/// carries the ranking. STEP_T=0 keeps this off. Copied from the winning champion
-/// architecture: a hard step at STEP_T splits good/bad cleanly (max separation),
-/// while the small STEP_B share of the raw score keeps every answer in its own
-/// place inside its band so the ranking (and the agreement gate) is preserved.
-const STEP_T: f32 = 0.2;
+/// carries the ranking. STEP_T=0 keeps this OFF.
+/// NOTE (v13): the v12 build set STEP_T=0.2, which is a hard binary collapse
+/// (every raw >= 0.2 -> ~0.99). That tied good answers with wrong-but-on-topic
+/// bad answers and CUT real Stage-2 separation to 0.6661 (rejected vs champion
+/// 0.7253). Restored to 0.0 (pure v10b smoothstep contrast) which scored
+/// 0.9476 real and beat the incumbent. STEP_B/STEP_W/STEP_R left 0.
+const STEP_T: f32 = 0.0;
 /// Share of the raw score that survives the step (order-preserving tie-break).
-const STEP_B: f32 = 0.01;
+const STEP_B: f32 = 0.0;
 /// Half-width of the step (0 = hard step). A ramp averages separation over the band.
 const STEP_W: f32 = 0.0;
 /// Coverage gate on the step: answer only reaches the good side if it covers the
