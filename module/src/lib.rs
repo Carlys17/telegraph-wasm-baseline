@@ -115,9 +115,9 @@ const POST_FRAC: f32 = 0.0;
 /// architecture: a hard step at STEP_T splits good/bad cleanly (max separation),
 /// while the small STEP_B share of the raw score keeps every answer in its own
 /// place inside its band so the ranking (and the agreement gate) is preserved.
-const STEP_T: f32 = 0.0;
+const STEP_T: f32 = 0.2;
 /// Share of the raw score that survives the step (order-preserving tie-break).
-const STEP_B: f32 = 0.004;
+const STEP_B: f32 = 0.01;
 /// Half-width of the step (0 = hard step). A ramp averages separation over the band.
 const STEP_W: f32 = 0.0;
 /// Coverage gate on the step: answer only reaches the good side if it covers the
