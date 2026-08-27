@@ -257,6 +257,15 @@ pub unsafe extern "C" fn rank_answer(
         return 0.0;
     }
 
+    // v14 hybrid: categorical claim gate. Cosine + BM25 cannot distinguish
+    // "critical" from "high" or "network" from "adjacent" — a wrong-but-plausible
+    // categorical answer saturates the composite to ~1.0. This gate crushes the score
+    // when the answer actively contradicts a categorical fact (severity, attack
+    // vector, or wrong-figure-with-no-overlap) the ground truth states.
+    if antigame::claim_mismatch(ground_truth, miner_answer) {
+        return antigame::CRUSH_SCORE;
+    }
+
     composite_v3(relevance, correctness, lexical)
 }
 
@@ -311,6 +320,11 @@ pub unsafe extern "C" fn rank_answer_cached(
         return 0.0;
     }
 
+    // v14 hybrid: categorical claim gate (same as rank_answer).
+    if antigame::claim_mismatch(ground_truth, miner_answer) {
+        return antigame::CRUSH_SCORE;
+    }
+
     composite_v3(relevance, correctness, lexical)
 }
 
@@ -348,6 +362,9 @@ pub unsafe extern "C" fn breakdown_answer(
 
     let composite_score = if antigame::is_degenerate(miner_answer, len_ratio) {
         0.0
+    } else if antigame::claim_mismatch(ground_truth, miner_answer) {
+        // v14 hybrid: categorical claim gate (same as rank_answer).
+        antigame::CRUSH_SCORE
     } else {
         composite_v3(relevance, correctness, lexical)
     };
@@ -406,6 +423,12 @@ pub unsafe extern "C" fn alloc(size: i32) -> i32 {
     ptr
 }
 
+/// The intent this build was tuned and gated for, exported so a registered
+/// binary can be traced back to the configuration it was measured with.
+/// Space-padded to a fixed width so the build stays byte-reproducible.
+#[no_mangle]
+pub static TELEGRAPH_INTENT: [u8; 32] = *b"CVE_LOOKUP                      ";
+
 /// Free memory previously returned by `alloc`.
 #[no_mangle]
 pub unsafe extern "C" fn dealloc(ptr: i32, size: i32) {
@@ -423,7 +446,10 @@ pub mod bench_api {
     //! signal values (real MiniLM cosines, BM25, critical-token match) on
     //! realistic CVE_LOOKUP triples instead of guessing operating points.
 
-    pub use crate::antigame::{answer_len_ratio, critical_token_match, is_degenerate};
+    pub use crate::antigame::{
+        answer_len_ratio, attack_vector, claim_mismatch, critical_token_match, is_degenerate,
+        severity_level,
+    };
     pub use crate::bm25::score as bm25;
     pub use crate::embed::run as embed;
     pub use crate::math::cosine;

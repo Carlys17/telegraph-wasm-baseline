@@ -441,6 +441,95 @@ pub fn critical_token_match(ground_truth: &str, answer: &str) -> f32 {
     (matched_weight / total_weight).clamp(0.0, 1.0)
 }
 
+// ── Categorical claim gates (v14 hybrid) ────────────────────────────────────
+// Cosine + BM25 cannot tell "critical" from "high" or "network" from "local":
+// a wrong-but-plausible categorical answer sits in the same embedding band as
+// a correct one and saturates the composite to ~1.0. These gates detect the
+// answer actively contradicting a categorical fact the ground truth states,
+// so the composite can crush it instead of crediting its topical similarity.
+
+/// Hard crush score for a confidently wrong categorical claim. A constant
+/// (not derived) so the WASM binary stays byte-reproducible across builds.
+pub const CRUSH_SCORE: f32 = 0.02;
+
+/// CVSS severity level named in `text`: 0 none, 1 low, 2 medium, 3 high,
+/// 4 critical. First level word wins (answers lead with the rating).
+pub fn severity_level(text: &str) -> u32 {
+    for t in tokenise(text) {
+        match t.as_str() {
+            "critical" => return 4,
+            "high" => return 3,
+            "medium" | "moderate" => return 2,
+            "low" => return 1,
+            _ => {}
+        }
+    }
+    0
+}
+
+/// CVSS attack vector named in `text`: 0 none, 1 network, 2 adjacent,
+/// 3 local, 4 physical. First vector word wins — a wrong answer often names
+/// several ("adjacent ... local network position") and the leading one is the
+/// claim being made.
+pub fn attack_vector(text: &str) -> u32 {
+    for t in tokenise(text) {
+        match t.as_str() {
+            "network" => return 1,
+            "adjacent" => return 2,
+            "local" => return 3,
+            "physical" => return 4,
+            _ => {}
+        }
+    }
+    0
+}
+
+/// Figures that carry a claim: all numbers in `text` EXCEPT digits inside CVE
+/// id spans (the year/serial of "CVE-2021-44228" are identifiers, not claimed
+/// values — without this exclusion an answer citing the right CVE id would
+/// "satisfy" a ground-truth year of 2021 while asserting disclosure in 2017)
+/// and EXCEPT version numbers ("v3.1", secondary facts, never conflict-worthy).
+fn claim_figures(text: &str) -> Vec<i32> {
+    let spans = extract_cve_spans(text);
+    all_numbers(text)
+        .into_iter()
+        .filter(|(_m, s, e, is_version)| {
+            !*is_version && !spans.iter().any(|(_, cs, ce)| *s >= *cs && *e <= *ce)
+        })
+        .map(|(m, _, _, _)| m)
+        .collect()
+}
+
+/// True when the answer actively contradicts a categorical fact the ground
+/// truth states: a different severity level, a different attack vector, or a
+/// confident wrong figure (GT states figures, the answer misses every one of
+/// them yet states figures of its own — wrong year, wrong count). Silence is
+/// NOT a contradiction: an answer that names no level/vector/figure is left
+/// to the semantic composite.
+pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
+    let gs = severity_level(ground_truth);
+    let asv = severity_level(answer);
+    if gs != 0 && asv != 0 && gs != asv {
+        return true;
+    }
+
+    let gv = attack_vector(ground_truth);
+    let av = attack_vector(answer);
+    if gv != 0 && av != 0 && gv != av {
+        return true;
+    }
+
+    let gt_figs = claim_figures(ground_truth);
+    if !gt_figs.is_empty() {
+        let ans_figs = claim_figures(answer);
+        if !ans_figs.is_empty() && !gt_figs.iter().any(|m| ans_figs.contains(m)) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Distinct-token ratio: unique terms / total terms in the answer. Used only by
 /// the degenerate-answer gate below, not as a smooth score multiplier.
 fn distinct_ratio(answer: &str) -> f32 {
