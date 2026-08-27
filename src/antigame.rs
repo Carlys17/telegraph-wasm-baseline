@@ -501,11 +501,11 @@ fn claim_figures(text: &str) -> Vec<i32> {
 }
 
 /// True when the answer actively contradicts a categorical fact the ground
-/// truth states: a different severity level, a different attack vector, or a
+/// truth states: a different severity level, a different attack vector, a
 /// confident wrong figure (GT states figures, the answer misses every one of
-/// them yet states figures of its own — wrong year, wrong count). Silence is
-/// NOT a contradiction: an answer that names no level/vector/figure is left
-/// to the semantic composite.
+/// them yet states figures of its own — wrong year, wrong count), or cites a
+/// wrong CVE id. Silence is NOT a contradiction: an answer that names no
+/// level/vector/figure/CVE is left to the semantic composite.
 pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
     let gs = severity_level(ground_truth);
     let asv = severity_level(answer);
@@ -517,6 +517,18 @@ pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
     let av = attack_vector(answer);
     if gv != 0 && av != 0 && gv != av {
         return true;
+    }
+
+    // Wrong CVE id: ground truth names a CVE and the answer cites a DIFFERENT
+    // CVE. Pure cosine can't tell CVE-123 from CVE-456, but they are distinct
+    // facts — crush it.
+    let (gt_cve_hits, gt_cve_count) = cve_match_score(ground_truth, answer);
+    if gt_cve_count > 0.0 && gt_cve_hits == 0.0 {
+        // ground truth has CVEs; answer either cites none or none match.
+        let ans_has_any = !extract_cve_spans(answer).is_empty();
+        if ans_has_any {
+            return true; // answer cites a CVE but the wrong one(s)
+        }
     }
 
     let gt_figs = claim_figures(ground_truth);
