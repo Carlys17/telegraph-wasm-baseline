@@ -774,11 +774,97 @@ fn claim_figures(text: &str) -> Vec<i32> {
         .collect()
 }
 
+/// Returns true when the answer substitutes a different entity for a key entity
+/// named in the ground truth, in the figure-less case.
+///
+/// For GTs that carry no claim figures (CVSS score, version, year...), the
+/// figure-completeness gate is silent. The composite then falls back to pure
+/// cosine similarity, which cannot distinguish "Apache Log4j2" from "Apache
+/// Commons Text" — same MiniLM band, same score.
+///
+/// This gate anchors on entity-bearing tokens in the GT: tokens that are
+/// either (a) alphanumeric with a digit embedded (product names like "Log4j2")
+/// OR (b) purely numeric with length >= 4 (serial numbers, component codes).
+/// CVE id digits are EXCLUDED (they are identifiers, not entity names).
+///
+/// The answer must contain every such entity token from the GT, either verbatim
+/// or as a >=4-char-prefix alias (e.g. "log4shell" is an alias for "log4j2"
+/// — both share the "log4" prefix). If a GT entity is absent from the answer
+/// AND no alias covers it, the answer is talking about a different subject.
+fn entity_substitution(ground_truth: &str, answer: &str) -> bool {
+    // Collect entity-bearing tokens from the GT. We skip CVE-internal digits
+    // (year/serial of "CVE-2021-44228") because those are identifiers, not
+    // entity names: an answer that omits the CVE serial is not talking
+    // about a different subject.
+    let gt_cve_text: Vec<String> =
+        extract_cve_spans(ground_truth).into_iter().map(|(c, _, _)| c).collect();
+
+    let gt_tokens: Vec<String> = tokenise(ground_truth);
+    let ans_tokens: Vec<String> = tokenise(answer);
+
+    let gt_entities: Vec<&str> = gt_tokens
+        .iter()
+        .filter_map(|t| {
+            let bytes = t.as_bytes();
+            let has_digit = bytes.iter().any(|b| b.is_ascii_digit());
+            let all_digit = bytes.iter().all(|b| b.is_ascii_digit());
+
+            // Pure-digit >=4 chars: check it's NOT inside a CVE id span.
+            if all_digit && t.len() >= 4 {
+                let in_cve = gt_cve_text.iter().any(|cve| {
+                    // CVE ids are canonicalised like CVE-YYYY-NNNN. The year and
+                    // serial are exactly 4 digits. A CVE span contains them.
+                    cve.split(|ch: char| !ch.is_ascii_digit())
+                        .filter(|s| !s.is_empty())
+                        .any(|part| part == t)
+                });
+                if in_cve {
+                    return None;
+                }
+                return Some(t.as_str());
+            }
+
+            // Alphanumeric with embedded digit: product/component name
+            // ("Log4j2", "OpenSSL3").
+            if has_digit && !all_digit {
+                return Some(t.as_str());
+            }
+
+            None
+        })
+        .collect();
+
+    // Early exit: no entities to check.
+    if gt_entities.is_empty() {
+        return false;
+    }
+
+    // For each GT entity, check if answer covers it (verbatim or alias).
+    for entity in &gt_entities {
+        let covered = ans_tokens
+            .iter()
+            .any(|a| a == entity || prefix_alias(entity, a));
+        if !covered {
+            return true; // missing entity, no alias — entity substitution
+        }
+    }
+
+    false
+}
+
+/// Returns true when `candidate` is a prefix alias of `canon` or vice-versa.
+/// Used for entity aliases like "Log4Shell" ≈ "Log4j2" (shared "log4" prefix).
+fn prefix_alias(canon: &str, candidate: &str) -> bool {
+    let min_len = 4; // minimum prefix length to consider an alias
+    if canon.len() < min_len || candidate.len() < min_len {
+        return false;
+    }
+    let prefix_len = canon.len().min(candidate.len());
+    canon[..prefix_len].eq_ignore_ascii_case(&candidate[..prefix_len])
+        && (canon.len() >= prefix_len + 1 || candidate.len() >= prefix_len + 1)
+}
+
 /// True when the answer actively contradicts a categorical fact the ground
-/// truth states: a different severity level, a different attack vector, a
-/// wrong anchored figure (CVSS/score/year/count under the same anchor), or
-/// cites a wrong CVE id. Silence is NOT a contradiction: an answer that names
-/// no level/vector/figure/CVE is left to the semantic composite.
 ///
 /// WHY anchored figures: our MiniLM INT8 embedding cannot separate 2021/2017
 /// (cos 0.968) or 10.0/7.5 (cos 0.907) — it gives a wrong year/score ~1.0
@@ -838,6 +924,18 @@ pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
     let gt_figs = claim_figures(ground_truth);
     let ans_figs = claim_figures(answer);
     if !gt_figs.is_empty() && !gt_figs.iter().all(|gf| ans_figs.contains(gf)) {
+        return true;
+    }
+
+    // Figure-less ground truth: entity-substitution gate. When GT carries no
+    // claim figures (e.g. "CVE-2021-44228 affects Apache Log4j2"), the
+    // figure-completeness gate above is silent and the composite falls back
+    // to pure cosine, which cannot tell "Apache Log4j2" from "Apache Commons
+    // Text" (same MiniLM band). Require every entity token of the GT (proper
+    // nouns and digit-bearing tokens) to appear in the answer, allowing
+    // >=4-char-prefix aliases ("Log4Shell" for "Log4j2"). A missing entity
+    // with no alias present means the answer names a DIFFERENT subject.
+    if gt_figs.is_empty() && entity_substitution(ground_truth, answer) {
         return true;
     }
 

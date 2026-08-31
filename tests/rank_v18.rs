@@ -22,3 +22,4 @@ fn v18_regressions() {
     assert!(egood > 0.5, "entity good rejected: {egood}");
     assert!(ebad < 0.2, "entity swap not rejected: {ebad}");
 }
+
