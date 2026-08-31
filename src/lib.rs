@@ -198,7 +198,7 @@ const SHARPEN_MU: f32 = 0.50;
 /// modulates. Near-miss wrong facts are handled by the claim gates, not by
 /// starving the cosine. High floor = closely track the champion's proven pure
 /// cosine behaviour while the gates add the edge.
-const SEM_FLOOR: f32 = 0.5;
+const SEM_FLOOR: f32 = 0.85;
 
 /// MiniLM-L6-v2 is anisotropic: pairwise cosine over real CVE text lands in a
 /// narrow band (unrelated ~0.2–0.4, factually-parallel ~0.7–0.9, exact ~0.98).
@@ -262,17 +262,18 @@ fn composite_v3(_relevance: f32, correctness: f32, lexical: f32, ground_truth: &
         // sharpening logistic maps it to ~1.0 like every other gated good.
         let cat = antigame::categorical_agreement(ground_truth, answer);
         if cat > 0.0 {
-            // Verified axis -> treat like a completeness pass (same floor the
-            // figure-bearing lane gives): sharpen maps 0.85 to ~0.99.
-            // Entity gate double-check: an answer whose entities don't match
-            // the GT's (SSH instead of HTTP/2, named-entity swap) must NOT get
-            // the categorical floor — claim_mismatch only ran entity checks
-            // when the GT was figure-less, which by definition it is here,
+            // Entity gate double-check: answer whose entities don't match the GT's
+            // (SSH instead of HTTP/2, named-entity swap) must NOT get the categorical
+            // floor — claim_mismatch only ran entity checks when the GT was figure-less,
             // so re-run entity_substitution defensively before lifting.
             if !antigame::entity_agrees(ground_truth, answer) {
                 c_norm
             } else {
-                let floor = 0.85f32;
+                // Verified axis -> treat like a completeness pass (same floor the
+                // figure-bearing lane gives): sharpen maps 0.9 to ~0.995.
+                // Raising floor from 0.85 to 0.9 pushes paraphrased-but-correct
+                // answers above the on-chain champion band, widening separation.
+                let floor = 0.9f32;
                 if c_norm < floor {
                     floor
                 } else {

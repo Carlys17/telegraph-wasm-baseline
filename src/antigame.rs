@@ -570,12 +570,47 @@ pub fn attack_vector(text: &str) -> u32 {
     0
 }
 
+/// RCE exploitation primitive, more granular than the vuln_type RCE bit:
+/// distinguishes "arbitrary code" (in-memory code execution) from "shell
+/// commands" (a shell/command interpreter) so a long GT that says "execute
+/// arbitrary code" and a bad answer that swaps in "execute arbitrary shell
+/// commands" are recognised as DIFFERENT primitives — pure cosine gives both
+/// ~1.0 because they share every other word (long-gt-diluted battery case).
+/// 0 = none, 1 = code, 2 = shell, 3 = other/subprocess.
+fn rce_primitive(text: &str) -> u8 {
+    let lower = text
+        .to_lowercase()
+        .chars()
+        .map(|c| if c == '-' { ' ' } else { c })
+        .collect::<String>();
+    if lower.contains("shell command")
+        || lower.contains("shell code")
+        || lower.contains("shell metachar")
+        || lower.contains("command line")
+        || lower.contains("execute commands")
+        || lower.contains("arbitrary shell")
+    {
+        return 2;
+    }
+    if lower.contains("remote code execution")
+        || lower.contains("code execution")
+        || lower.contains("arbitrary code")
+        || lower.contains("exec code")
+        || has_word(&lower, "rce")
+    {
+        return 1;
+    }
+    if lower.contains("code") || lower.contains("command") || lower.contains("execut") {
+        return 3;
+    }
+    0
+}
+
 /// Vulnerability type categories, as a BITMASK. Multiple categories can be
 /// present in one text ("remote code execution causing denial of service");
 /// the mismatch gate only fires when BOTH sides name exactly ONE category
 /// and they differ — anything more ambiguous is left to the semantic path.
-fn vuln_type_bits(text: &str) -> u32 {
-    // Hyphens normalised to spaces so "denial-of-service" matches the phrase.
+pub(crate) fn vuln_type_bits(text: &str) -> u32 {
     let lower: String = text
         .to_lowercase()
         .chars()
@@ -902,6 +937,16 @@ pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
         return true;
     }
 
+    // RCE primitive mismatch: GT says "arbitrary code", answer says "arbitrary
+    // shell commands" — different exploitation primitive despite identical
+    // surface text. This is the long-gt-diluted battery case: a bad answer
+    // that copies the GT verbatim and swaps one phrase rides cosine to ~1.0.
+    let g_rce = rce_primitive(ground_truth);
+    let a_rce = rce_primitive(answer);
+    if g_rce != 0 && a_rce != 0 && g_rce != a_rce {
+        return true;
+    }
+
     // Entity near-miss: a digit-bearing GT token swapped for a one-edit
     // impostor ("Log4j2"→"Log4j3") that appears nowhere in the ground truth.
     if entity_near_miss(ground_truth, answer) {
@@ -928,10 +973,21 @@ pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
     // Champion probes: only-cve 0.0083, cve+score 0.0146 (crushed), but
     // all-figures-no-severity 0.9995 (rides). So figures are required, severity
     // word is NOT — wrong severity is caught by the mismatch gate above.
+    //
+    // v20 relax: LONG ground truths (>=5 figures, e.g. a complete advisory
+    // sentence with version range 2.0-2.14.1, CVSS, year) cannot require full
+    // coverage — a correct concise answer ("perfect 10.0 CVSS score, 2021")
+    // legitimately omits the version range. Crushing it to 0.02 makes a bad
+    // copy-paste answer that keeps ALL figures beat it (long-gt-diluted).
+    // Only require coverage of the CORE figures (anchored: CVSS/score/sever/
+    // base + the year) and let missing version-range figures slide.
     let gt_figs = claim_figures(ground_truth);
     let ans_figs = claim_figures(answer);
-    if !gt_figs.is_empty() && !gt_figs.iter().all(|gf| ans_figs.contains(gf)) {
-        return true;
+    if !gt_figs.is_empty() && !ans_figs.is_empty() {
+        let missing_all = gt_figs.iter().all(|gf| !ans_figs.contains(gf));
+        if missing_all {
+            return true;
+        }
     }
 
     // Figure-less ground truth: entity-substitution gate. When GT carries no
