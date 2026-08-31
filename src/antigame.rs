@@ -175,6 +175,14 @@ fn extract_numbers_raw(text: &str) -> Vec<(i32, usize, usize, bool)> {
                 i += 1;
             }
             if i > start {
+                let len = i - start;
+                // Skip single-digit runs: they are almost always embedded in
+                // alphanumeric words ("Log4Shell" -> 4, "OpenSSL1.0" -> 1) and
+                // are NOT intended factual claims. CVE serial / year / CVSS
+                // score / version tokens are all 2+ characters.
+                if len < 2 {
+                    continue;
+                }
                 if let Some(milli) = parse_decimal_milli(&text[start..i]) {
                     let is_version = start > 0
                         && (bytes[start - 1] == b'v' || bytes[start - 1] == b'V');
@@ -308,12 +316,33 @@ fn cve_match_score(ground_truth: &str, answer: &str) -> (f32, f32) {
 /// tell 7.5 from 9.8, this signal can.
 ///
 /// Weights: CVE id 1.0, anchored number 3.0, bare number 0.3.
+///
+/// `critical_token_match` is the public [0,1] view (figure-less GT -> neutral
+/// 1.0). The composite uses `critical_token_match_raw`, which returns the
+/// sentinel -1.0 for a figure-less ground truth so the scorer can switch to
+/// pure-cosine evidence instead of letting the neutral 1.0 override cosine.
 pub fn critical_token_match(ground_truth: &str, answer: &str) -> f32 {
+    let m = critical_token_match_raw(ground_truth, answer);
+    if m < 0.0 {
+        1.0
+    } else {
+        m
+    }
+}
+
+/// Sentinel returned when the ground truth carries NO fact-bearing tokens
+/// (no CVE ids, no anchored/bare numbers, no versions): -1.0. Callers decide
+/// what "no facts to check" means for their composite.
+pub fn critical_token_match_raw(ground_truth: &str, answer: &str) -> f32 {
     let lower_gt = ground_truth.to_lowercase();
     let lower_ans = answer.to_lowercase();
 
     let gt_cve_spans = extract_cve_spans(ground_truth);
-    let ans_cves: Vec<String> = extract_cve_spans(answer).into_iter().map(|(c, _, _)| c).collect();
+    let ans_cve_spans = extract_cve_spans(answer);
+    let ans_cves: Vec<String> = ans_cve_spans
+        .iter()
+        .map(|(c, _, _)| c.clone())
+        .collect();
 
     let mut total_weight = 0.0f32;
     let mut matched_weight = 0.0f32;
@@ -392,39 +421,53 @@ pub fn critical_token_match(ground_truth: &str, answer: &str) -> f32 {
 
         if let Some(stem) = anchor {
             total_weight += W_ANCHORED;
-            // Values the answer states near the SAME anchor stem (either side).
-            // Score-family anchors are interchangeable: GT "base score of 9.8"
-            // vs answer "CVSS 9.8" is the same fact.
-            let stems: &[&str] = if SCORE_STEMS.contains(&stem) {
-                SCORE_STEMS
-            } else {
-                core::slice::from_ref(&stem)
-            };
-            let mut values: Vec<i32> = Vec::new();
-            for st in stems {
-                let mut search = 0usize;
-                while search < lower_ans.len() {
-                    let rel = match lower_ans[search..].find(st) {
-                        Some(p) => p,
-                        None => break,
-                    };
-                    let occ_start = search + rel;
-                    let occ_end = occ_start + st.len();
-                    let lo = snap(&lower_ans, occ_start.saturating_sub(FACT_WINDOW));
-                    let hi = snap(&lower_ans, (occ_end + FACT_WINDOW).min(lower_ans.len()));
-                    for (m, ns, _, _) in &ans_numbers {
-                        if *ns >= lo && *ns < hi {
-                            values.push(*m);
-                        }
-                    }
-                    search = occ_end;
-                }
-            }
-            if values.iter().any(|v| v == milli) {
+            // Paraphrase-tolerant credit: the answer gets credit if it states
+            // the GT value ANYWHERE (a correct answer may anchor the number
+            // with a different word — GT "severity rating of 10.0" vs answer
+            // "CVSS score of 10.0"). We only PENALISE on an active conflict:
+            // the answer states a DIFFERENT value near the same anchor stem.
+            // This keeps wrong-number answers crushed while letting correct
+            // paraphrases through.
+            if ans_numbers.iter().any(|(m, _, _, _)| m == milli) {
                 matched_weight += W_ANCHORED;
-            } else if !values.is_empty() {
-                // Conflicting value next to the same anchor: worse than silence.
-                matched_weight -= W_ANCHORED;
+            } else {
+                // No exact value anywhere. Check for an active conflict: a
+                // different value stated near the same anchor stem in the
+                // answer. Score-family anchors are interchangeable.
+                let stems: &[&str] = if SCORE_STEMS.contains(&stem) {
+                    SCORE_STEMS
+                } else {
+                    core::slice::from_ref(&stem)
+                };
+                let mut conflict = false;
+                for st in stems {
+                    let mut search = 0usize;
+                    while search < lower_ans.len() {
+                        let rel = match lower_ans[search..].find(st) {
+                            Some(p) => p,
+                            None => break,
+                        };
+                        let occ_start = search + rel;
+                        let occ_end = occ_start + st.len();
+                        let lo = snap(&lower_ans, occ_start.saturating_sub(FACT_WINDOW));
+                        let hi = snap(&lower_ans, (occ_end + FACT_WINDOW).min(lower_ans.len()));
+                        for (m, ns, _, _) in &ans_numbers {
+                            // Digits inside the answer's OWN CVE id must not be
+                            // treated as a conflicting figure (the CVE branch
+                            // already scores the id itself).
+                            if ans_cve_spans.iter().any(|(_, cs, ce)| *ns >= *cs && *ns < *ce) {
+                                continue;
+                            }
+                            if *ns >= lo && *ns < hi && *m != *milli {
+                                conflict = true;
+                            }
+                        }
+                        search = occ_end;
+                    }
+                }
+                if conflict {
+                    matched_weight -= W_ANCHORED;
+                }
             }
         } else {
             total_weight += W_BARE;
@@ -435,7 +478,7 @@ pub fn critical_token_match(ground_truth: &str, answer: &str) -> f32 {
     }
 
     if total_weight == 0.0 {
-        return 1.0; // neutral, no fact-bearing tokens
+        return -1.0; // sentinel: no fact-bearing tokens in GT
     }
 
     (matched_weight / total_weight).clamp(0.0, 1.0)
@@ -502,10 +545,16 @@ fn claim_figures(text: &str) -> Vec<i32> {
 
 /// True when the answer actively contradicts a categorical fact the ground
 /// truth states: a different severity level, a different attack vector, a
-/// confident wrong figure (GT states figures, the answer misses every one of
-/// them yet states figures of its own — wrong year, wrong count), or cites a
-/// wrong CVE id. Silence is NOT a contradiction: an answer that names no
-/// level/vector/figure/CVE is left to the semantic composite.
+/// wrong anchored figure (CVSS/score/year/count under the same anchor), or
+/// cites a wrong CVE id. Silence is NOT a contradiction: an answer that names
+/// no level/vector/figure/CVE is left to the semantic composite.
+///
+/// WHY anchored figures: our MiniLM INT8 embedding cannot separate 2021/2017
+/// (cos 0.968) or 10.0/7.5 (cos 0.907) — it gives a wrong year/score ~1.0
+/// cosine just like a right one. Pure cosine would saturate those bad answers.
+/// The lexical anchor-stem match in `critical_token_match` CAN distinguish them
+/// because "cvss 10.0" vs "cvss 7.5" are literally different token spans.
+/// This gate is the lexical veto on semantic-overlap bad answers.
 pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
     let gs = severity_level(ground_truth);
     let asv = severity_level(answer);
@@ -524,17 +573,25 @@ pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
     // facts — crush it.
     let (gt_cve_hits, gt_cve_count) = cve_match_score(ground_truth, answer);
     if gt_cve_count > 0.0 && gt_cve_hits == 0.0 {
-        // ground truth has CVEs; answer either cites none or none match.
         let ans_has_any = !extract_cve_spans(answer).is_empty();
         if ans_has_any {
-            return true; // answer cites a CVE but the wrong one(s)
+            return true;
         }
     }
 
+    // Anchored numeric mismatch is handled by the claim_figures gate below:
+    // GT states figures, the answer states figures, and none of the answer's
+    // figures match any of GT's → wrong year/score/count → crush.
+
+    // Completeness gate (champion behavior): if the ground truth states figures,
+    // the answer MUST cover ALL of them. Missing a figure -> crushed.
+    // Champion probes: only-cve 0.0083, cve+score 0.0146 (crushed), but
+    // all-figures-no-severity 0.9995 (rides). So figures are required, severity
+    // word is NOT — wrong severity is caught by the mismatch gate above.
     let gt_figs = claim_figures(ground_truth);
     if !gt_figs.is_empty() {
         let ans_figs = claim_figures(answer);
-        if !ans_figs.is_empty() && !gt_figs.iter().any(|m| ans_figs.contains(m)) {
+        if !gt_figs.iter().all(|gf| ans_figs.contains(gf)) {
             return true;
         }
     }

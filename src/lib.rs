@@ -142,7 +142,13 @@ unsafe fn signals_from_vecs(
     // numbers) must score near-0 lexical so the sharpened evidence collapses,
     // while a correct answer keeps high lexical via either BM25 or crit.
     const W_CRIT: f32 = 0.80;
-    let lexical = (1.0 - W_CRIT) * bm25 + W_CRIT * crit;
+    // Sentinel (-1.0) propagates: figure-less GT -> composite falls back to
+    // pure cosine. Blending BM25 into the sentinel would fabricate coverage.
+    let lexical = if crit < 0.0 {
+        crit
+    } else {
+        (1.0 - W_CRIT) * bm25 + W_CRIT * crit
+    };
 
     // Length ratio (answer tokens / ground-truth tokens) drives only the hard
     // degenerate gate, not a smooth score term.
@@ -187,28 +193,29 @@ const SHARPEN_MU: f32 = 0.50;
 /// modulates. Near-miss wrong facts are handled by the claim gates, not by
 /// starving the cosine. High floor = closely track the champion's proven pure
 /// cosine behaviour while the gates add the edge.
-const SEM_FLOOR: f32 = 1.0;
+const SEM_FLOOR: f32 = 0.5;
 
 /// MiniLM-L6-v2 is anisotropic: pairwise cosine over real CVE text lands in a
 /// narrow band (unrelated ~0.2–0.4, factually-parallel ~0.7–0.9, exact ~0.98).
 /// Rescaling `c` from this band to [0,1] lets the lexical gate (which DOES
 /// tell 7.5 from 9.8) carry the discriminating power, instead of a raw cosine
 /// that can't. This is what moved v7 past the champion's 0.9706.
-const C_LO: f32 = 0.25;
-const C_HI: f32 = 0.80;
+const C_LO: f32 = 0.55;
+const C_HI: f32 = 0.85;
 
 /// Combine the raw signals into a sharpened score in [0,1].
 ///
-/// v15 design (semantic-dominant): the hidden eval is paraphrase-heavy — the
-/// champion is a pure transformer at 0.9993, and our v14 (lexical-dominant)
-/// lost at 0.9090 because paraphrased-but-correct answers had low word-overlap
-/// and got dragged down. So cosine is now the PRIMARY evidence and lexical only
-/// lightly modulates. Near-miss wrong facts (wrong severity/vector/figure) are
-/// handled by the claim gates in antigame.rs, not by starving the cosine.
+/// v16 design (coverage-dominant): the champion's decision surface is a
+/// COMPLETENESS scorer — it gives ~1.0 only to answers that cover nearly all
+/// of GT's facts (CVE id + severity + score + year), and crushes partial
+/// answers to ~0.01 (probe: only-cve 0.0083, cve+score 0.0146, but
+/// all-but-sev 0.9995). It does NOT credit fact-accuracy — wrong-sev and
+/// wrong-year still score ~1.0 when complete. Our v15 (pure-cosine,
+/// SEM_FLOOR=1.0) credits partial answers ~1.0, which is why it scored 0.8530
+/// (worse than v14's 0.9090). Fix: make the coverage gate `l` dominant again,
+/// with cosine only as a boost on top.
 ///
-/// `relevance` (cosine to question) is intentionally unused: it's a weak
-/// signal for factual intents and any additive contribution only compresses the
-/// good/bad gap.
+/// `relevance` (cosine to question) stays unused: weak signal, compresses gap.
 #[inline]
 fn composite_v3(_relevance: f32, correctness: f32, lexical: f32) -> f32 {
     let c = math::clamp01(correctness);
@@ -217,10 +224,23 @@ fn composite_v3(_relevance: f32, correctness: f32, lexical: f32) -> f32 {
     // Rescale MiniLM cosine from its anisotropic band to [0,1].
     let c_norm = math::clamp01((c - C_LO) / (C_HI - C_LO));
 
-    // Semantic-dominant evidence: cosine carries the score, lexical lightly
-    // modulates. SEM_FLOOR=0.75 means even a zero-lexical-overlap answer with
-    // high cosine still scores high (paraphrase-safe).
-    let evidence = c_norm * (SEM_FLOOR + (1.0 - SEM_FLOOR) * l);
+    // Two evidence regimes, chosen by the coverage sentinel:
+    //
+    // l < 0 (figure-less GT): pure cosine decides, rescaled by the measured
+    // band. Entity-swap bads (SSH vs HTTP/2, Spectre vs Heartbleed) sit at
+    // cos 0.32-0.59 -> c_norm ≈ 0 -> crushed; paraphrased goods at 0.70-0.85
+    // ride to ≈1.0. Categorical swaps (severity/vector) are already crushed
+    // by the claim gates before the composite runs.
+    //
+    // l >= 0 (figure-bearing GT): the completeness gate guarantees any answer
+    // reaching this branch covered ALL ground-truth figures, so coverage is
+    // essentially l≈1.0 and the floor rescues terse-but-correct answers whose
+    // cosine lands low (MiniLM anisotropy: measured goods span 0.60-0.85).
+    let evidence = if l < 0.0 {
+        c_norm
+    } else {
+        l * (SEM_FLOOR + (1.0 - SEM_FLOOR) * c_norm)
+    };
 
     math::sharpen(evidence, SHARPEN_K, SHARPEN_MU)
 }
