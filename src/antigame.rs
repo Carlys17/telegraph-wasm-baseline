@@ -583,10 +583,17 @@ fn vuln_type_bits(text: &str) -> u32 {
         .collect();
 
     let mut bits = 0u32;
-    // RCE / code execution
+    // RCE / code execution. "shell commands" is grouped here: a long GT
+    // paraphrase that swaps "execute arbitrary code" for "execute arbitrary
+    // shell commands" describes a DIFFERENT exploitation primitive, and pure
+    // cosine scores both ~1.0 (v18.1 on-chain loss: long-gt-diluted).
     if lower.contains("remote code execution")
         || lower.contains("code execution")
         || lower.contains("arbitrary code")
+        || lower.contains("arbitrary shell")
+        || lower.contains("shell commands")
+        || lower.contains("command execution")
+        || lower.contains("execute commands")
         || has_word(&lower, "rce")
     {
         bits |= 1;
@@ -966,6 +973,37 @@ pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
     false
 }
 
+/// Categorical agreement signal for figure-less ground truths: 1.0 when the
+/// answer explicitly restates a categorical fact the GT states (same severity
+/// level, same attack vector, or the same single vulnerability type), else 0.0.
+///
+/// WHY: for a figure-less GT ("CVE-2023-44487 has a high severity rating"),
+/// the only checkable content IS the categorical claim. A paraphrased good
+/// ("is rated high") can land at MiniLM cosine 0.51 — below the rescale band —
+/// so pure cosine crushes it. But if the answer names the SAME severity level
+/// the GT names, that axis is verified correct by exact lexical match, which
+/// is far stronger evidence than a noisy cosine. Wrong categories are already
+/// crushed by claim_mismatch before this is consulted, and an answer that
+/// names no category gets 0.0 (falls back to cosine).
+pub fn categorical_agreement(ground_truth: &str, answer: &str) -> f32 {
+    let gs = severity_level(ground_truth);
+    let asv = severity_level(answer);
+    if gs != 0 && asv != 0 && gs == asv {
+        return 1.0;
+    }
+    let gv = attack_vector(ground_truth);
+    let av = attack_vector(answer);
+    if gv != 0 && av != 0 && gv == av {
+        return 1.0;
+    }
+    let gt_bits = vuln_type_bits(ground_truth);
+    let at_bits = vuln_type_bits(answer);
+    if gt_bits != 0 && gt_bits == at_bits {
+        return 1.0;
+    }
+    0.0
+}
+
 /// Distinct-token ratio: unique terms / total terms in the answer. Used only by
 /// the degenerate-answer gate below, not as a smooth score multiplier.
 fn distinct_ratio(answer: &str) -> f32 {
@@ -1093,4 +1131,30 @@ mod tests {
             1.1
         ));
     }
+}
+/// True when the answer does NOT swap a key entity/protocol named in the GT.
+/// Used by the figure-less categorical lift as a defensive re-check: an
+/// answer can name the same severity level ("DoS") while swapping the
+/// affected protocol or product ("SSH" instead of "HTTP/2"). We require the
+/// answer to keep every protocol marker the GT names (token that appears
+/// adjacent to a known protocol context, or a known protocol token itself).
+pub fn entity_agrees(ground_truth: &str, answer: &str) -> bool {
+    // Protocol markers are checked verbatim on the raw lowercased text so
+    // "HTTP/2" survives (the alphanumeric tokenizer splits it into http, 2).
+    const PROTOCOLS: &[&str] = &[
+        "http/2", "http/1", "http/3", "http", "https", "ssh", "ftp", "smtp",
+        "dns", "tls", "ssl", "rdp", "smb", "ldap", "dhcp", "quic", "grpc",
+        "websocket", "modbus", "telnet", "nfs", "snmp", "imap", "pop3",
+        "kerberos", "ntlm", "oauth", "sip", "rtsp", "mqtt", "amqp", "coap",
+    ];
+    let gt_l = ground_truth.to_lowercase();
+    let an_l = answer.to_lowercase();
+    for p in PROTOCOLS {
+        // Longer first to prefer the most specific match; contains() handles
+        // that naturally because we check all of them independently.
+        if gt_l.contains(p) && !an_l.contains(p) {
+            return false;
+        }
+    }
+    true
 }
