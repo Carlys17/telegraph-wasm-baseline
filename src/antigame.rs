@@ -481,6 +481,15 @@ pub fn critical_token_match_raw(ground_truth: &str, answer: &str) -> f32 {
         return -1.0; // sentinel: no fact-bearing tokens in GT
     }
 
+    // A CVE identifier alone is an entity key, not a figure-bearing answer
+    // lane. When GT contains only a CVE id plus prose (e.g. "affects Log4j2"
+    // where the trailing 2 is a single digit embedded in a product name),
+    // keep the sentinel. Otherwise a cited CVE would turn lexical coverage
+    // into 1.0 and route entity-swap answers through the completeness floor.
+    if total_weight == W_CVE {
+        return -1.0;
+    }
+
     (matched_weight / total_weight).clamp(0.0, 1.0)
 }
 

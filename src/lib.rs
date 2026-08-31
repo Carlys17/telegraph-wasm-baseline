@@ -136,7 +136,12 @@ unsafe fn signals_from_vecs(
     // critical-token signal keys exactly on the numbers/ids/versions that carry
     // the truth, giving the gate real discriminating power on wrong-number answers.
     let bm25 = bm25::score(ground_truth, miner_answer);
-    let crit = antigame::critical_token_match(ground_truth, miner_answer);
+    // RAW variant: the -1.0 sentinel (figure-less ground truth) must reach the
+    // composite so it can switch to the pure-cosine regime. The public
+    // [0,1] view maps the sentinel to a neutral 1.0, which fabricates
+    // lexical coverage on entity-swap cases and was silently dead-coding
+    // the figure-less branch (v16/v17 entity bads rode to 0.69-1.0).
+    let crit = antigame::critical_token_match_raw(ground_truth, miner_answer);
     // Critical-token (fact-bearing digit/version/CVE-id) match dominates the
     // lexical gate: a topically-identical WRONG answer (right words, wrong
     // numbers) must score near-0 lexical so the sharpened evidence collapses,
@@ -219,6 +224,10 @@ const C_HI: f32 = 0.85;
 #[inline]
 fn composite_v3(_relevance: f32, correctness: f32, lexical: f32) -> f32 {
     let c = math::clamp01(correctness);
+    // Preserve the -1 sentinel from critical_token_match_raw. Clamping it
+    // before the branch turns figure-less GT into l=0 and incorrectly applies
+    // the figure-bearing completeness floor to entity-swap cases.
+    let figure_bearing = lexical >= 0.0;
     let l = math::clamp01(lexical);
 
     // Rescale MiniLM cosine from its anisotropic band to [0,1].
@@ -236,10 +245,17 @@ fn composite_v3(_relevance: f32, correctness: f32, lexical: f32) -> f32 {
     // reaching this branch covered ALL ground-truth figures, so coverage is
     // essentially l≈1.0 and the floor rescues terse-but-correct answers whose
     // cosine lands low (MiniLM anisotropy: measured goods span 0.60-0.85).
-    let evidence = if l < 0.0 {
+    let evidence = if !figure_bearing {
         c_norm
     } else {
-        l * (SEM_FLOOR + (1.0 - SEM_FLOOR) * c_norm)
+        // A figure-bearing answer reaches this branch only after
+        // claim_mismatch confirms every GT figure is covered and no active
+        // contradiction exists. Treat that as a completeness pass. Do not
+        // multiply by cosine: MiniLM paraphrase cosine can be as low as 0.56
+        // for a correct answer, which would collapse its separation margin.
+        // The lexical coverage value l is already the factual evidence; keep
+        // a semantic floor so a concise paraphrase is still near-perfect.
+        math::clamp01(if l > SEM_FLOOR { l } else { SEM_FLOOR })
     };
 
     math::sharpen(evidence, SHARPEN_K, SHARPEN_MU)
@@ -481,6 +497,24 @@ pub mod bench_api {
     pub use crate::embed::run as embed;
     pub use crate::math::cosine;
     pub use crate::tokenizer::tokenize;
+
+    /// Native-safe wrapper for regression tests. WASM exports use linear-memory
+    /// pointers and must not be called with host-process pointers.
+    pub fn score_answer(question: &str, ground_truth: &str, miner_answer: &str) -> f32 {
+        if miner_answer.trim().is_empty() {
+            return 0.0;
+        }
+        let (relevance, correctness, lexical, len_ratio) = unsafe {
+            crate::compute_signals(question, ground_truth, miner_answer)
+        };
+        if crate::antigame::is_degenerate(miner_answer, len_ratio) {
+            return 0.0;
+        }
+        if crate::antigame::claim_mismatch(ground_truth, miner_answer) {
+            return crate::antigame::graded_crush(ground_truth, miner_answer);
+        }
+        crate::composite_v3(relevance, correctness, lexical)
+    }
 
     /// All raw signals for one triple:
     /// (relevance, correctness, bm25, crit, len_ratio).
