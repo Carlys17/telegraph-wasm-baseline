@@ -495,6 +495,40 @@ pub fn critical_token_match_raw(ground_truth: &str, answer: &str) -> f32 {
 /// (not derived) so the WASM binary stays byte-reproducible across builds.
 pub const CRUSH_SCORE: f32 = 0.02;
 
+/// Count how many of GT's claim figures are missing from the answer.
+fn missing_figure_count(ground_truth: &str, answer: &str) -> usize {
+    let gt_figs = claim_figures(ground_truth);
+    if gt_figs.is_empty() {
+        return 0;
+    }
+    let ans_figs = claim_figures(answer);
+    gt_figs.iter().filter(|gf| !ans_figs.contains(gf)).count()
+}
+
+/// Graded crush score in (0, CRUSH_SCORE]: an answer missing more of the GT
+/// figures crushes lower than one missing fewer. Champion probes follow this
+/// shape (only-cve 0.0083, cve+score 0.0146, all-but-sev 0.9995). A fixed
+/// CRUSH_SCORE would tie those three against the corresponding good answers,
+/// and a tie counts as a loss in the ordering metric.
+pub fn graded_crush(ground_truth: &str, answer: &str) -> f32 {
+    let gt_figs = claim_figures(ground_truth);
+    if gt_figs.is_empty() {
+        return CRUSH_SCORE;
+    }
+    let missing = missing_figure_count(ground_truth, answer);
+    let total = gt_figs.len();
+    if missing == 0 {
+        // No mismatch reason survives here; just return the floor.
+        return CRUSH_SCORE;
+    }
+    // More missing figures → lower score. Anchor: missing=1 of N → ~CRUSH*0.7,
+    // missing=total → 0.002. Monotonically decreasing so partial-good vs
+    // total-bad always orders correctly.
+    let frac_missing = missing as f32 / total as f32;
+    let score = CRUSH_SCORE * (1.0 - 0.9 * frac_missing);
+    score.max(CRUSH_SCORE * 0.1)
+}
+
 /// CVSS severity level named in `text`: 0 none, 1 low, 2 medium, 3 high,
 /// 4 critical. First level word wins (answers lead with the rating).
 pub fn severity_level(text: &str) -> u32 {
@@ -525,6 +559,194 @@ pub fn attack_vector(text: &str) -> u32 {
         }
     }
     0
+}
+
+/// Vulnerability type categories, as a BITMASK. Multiple categories can be
+/// present in one text ("remote code execution causing denial of service");
+/// the mismatch gate only fires when BOTH sides name exactly ONE category
+/// and they differ — anything more ambiguous is left to the semantic path.
+fn vuln_type_bits(text: &str) -> u32 {
+    // Hyphens normalised to spaces so "denial-of-service" matches the phrase.
+    let lower: String = text
+        .to_lowercase()
+        .chars()
+        .map(|c| if c == '-' { ' ' } else { c })
+        .collect();
+
+    let mut bits = 0u32;
+    // RCE / code execution
+    if lower.contains("remote code execution")
+        || lower.contains("code execution")
+        || lower.contains("arbitrary code")
+        || has_word(&lower, "rce")
+    {
+        bits |= 1;
+    }
+    // Denial of service
+    if lower.contains("denial of service")
+        || lower.contains("resource exhaustion")
+        || has_word(&lower, "dos")
+    {
+        bits |= 2;
+    }
+    // Information disclosure / leak
+    if lower.contains("information disclosure")
+        || lower.contains("information exposure")
+        || lower.contains("information leak")
+        || lower.contains("memory disclosure")
+        || lower.contains("memory leak")
+        || lower.contains("data leak")
+        || lower.contains("data exposure")
+        || lower.contains("data breach")
+        || lower.contains("sensitive data")
+    {
+        bits |= 4;
+    }
+    // Injection family
+    if lower.contains("sql injection")
+        || lower.contains("xpath injection")
+        || lower.contains("code injection")
+        || lower.contains("command injection")
+        || lower.contains("ldap injection")
+        || lower.contains("template injection")
+    {
+        bits |= 8;
+    }
+    // Privilege escalation / sandbox escape
+    if lower.contains("privilege escalation")
+        || lower.contains("elevation of privilege")
+        || lower.contains("sandbox escape")
+        || has_word(&lower, "eop")
+    {
+        bits |= 16;
+    }
+    // Authentication / access control
+    if lower.contains("authentication bypass")
+        || lower.contains("auth bypass")
+        || lower.contains("broken auth")
+        || lower.contains("access control")
+        || has_word(&lower, "csrf")
+    {
+        bits |= 32;
+    }
+    // Cross-site scripting
+    if lower.contains("cross site scripting") || has_word(&lower, "xss") {
+        bits |= 64;
+    }
+    // Path / directory traversal
+    if lower.contains("path traversal") || lower.contains("directory traversal") {
+        bits |= 128;
+    }
+    // SSRF
+    if lower.contains("request forgery") || has_word(&lower, "ssrf") {
+        bits |= 256;
+    }
+    // Memory safety
+    if lower.contains("buffer overflow")
+        || lower.contains("heap overflow")
+        || lower.contains("use after free")
+        || lower.contains("double free")
+        || lower.contains("type confusion")
+        || has_word(&lower, "uaf")
+    {
+        bits |= 512;
+    }
+    bits
+}
+
+/// Whole-word check for short/acronym keywords ("rce", "dos", "xss"): the match
+/// must sit on non-alphanumeric boundaries so "kudos" never hits "dos". Works
+/// on raw BYTES so multi-byte UTF-8 (emoji, CJK) can never split a char and
+/// panic the no_std build.
+fn has_word(lower: &str, word: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let wb = word.as_bytes();
+    let wl = wb.len();
+    if wl == 0 || bytes.len() < wl {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + wl <= bytes.len() {
+        if &bytes[i..i + wl] == wb {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after_ok = i + wl == bytes.len() || !bytes[i + wl].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Levenshtein edit distance between two short byte strings (bounded: tokens
+/// are at most ~24 bytes, so this stays trivially cheap and allocation-free).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut prev: [u8; 33] = [0; 33];
+    let mut cur: [u8; 33] = [0; 33];
+    if a.len() > 32 || b.len() > 32 {
+        return usize::MAX; // out of scope for this gate
+    }
+    for (j, _) in b.iter().enumerate() {
+        prev[j + 1] = j as u8 + 1;
+    }
+    for i in 1..=a.len() {
+        cur[0] = i as u8;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        core::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()] as usize
+}
+
+/// Entity near-miss: the answer swaps ONE digit-bearing token for a
+/// one-edit-away neighbour — "Log4j2"→"Log4j3", "44228"→"44229", "2021"→"2022"
+/// — while omitting the ground-truth token entirely. Cosine and BM25 cannot
+/// see a single swapped character; this can. Only fires on digit-bearing
+/// tokens (pure-digit runs must be ≥4 chars, mixed tokens ≥3) so
+/// plural/inflection differences ("server"/"servers") never trigger it.
+fn entity_near_miss(ground_truth: &str, answer: &str) -> bool {
+    let gt_tokens = tokenise(ground_truth);
+    let ans_tokens = tokenise(answer);
+
+    for t in &gt_tokens {
+        let has_digit = t.chars().any(|c| c.is_ascii_digit());
+        if !has_digit {
+            continue;
+        }
+        let all_digits = t.chars().all(|c| c.is_ascii_digit());
+        if all_digits && t.len() < 4 {
+            continue; // years / serials only, not "2", "10"
+        }
+        if !all_digits && t.len() < 3 {
+            continue;
+        }
+        // Ground-truth token absent from the answer: look for a one-edit
+        // impostor the answer uses instead.
+        if ans_tokens.iter().any(|u| u == t) {
+            continue;
+        }
+        for u in &ans_tokens {
+            if u == t {
+                continue;
+            }
+            let u_digit = u.chars().any(|c| c.is_ascii_digit());
+            if !u_digit {
+                continue;
+            }
+            if gt_tokens.iter().any(|g| g == u) {
+                continue; // the impostor also appears in GT: not a swap
+            }
+            if edit_distance(t, u) == 1 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Figures that carry a claim: all numbers in `text` EXCEPT digits inside CVE
@@ -568,6 +790,22 @@ pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
         return true;
     }
 
+    // Vulnerability type mismatch. Pure cosine cannot separate "denial of
+    // service" from "information disclosure" (both sit in the same MiniLM
+    // band) — a wrong-type answer keeps all GT figures and rides the cosine.
+    // Fires only when both sides name exactly ONE category and they differ.
+    let gt_bits = vuln_type_bits(ground_truth);
+    let at_bits = vuln_type_bits(answer);
+    if gt_bits.count_ones() == 1 && at_bits.count_ones() == 1 && gt_bits != at_bits {
+        return true;
+    }
+
+    // Entity near-miss: a digit-bearing GT token swapped for a one-edit
+    // impostor ("Log4j2"→"Log4j3") that appears nowhere in the ground truth.
+    if entity_near_miss(ground_truth, answer) {
+        return true;
+    }
+
     // Wrong CVE id: ground truth names a CVE and the answer cites a DIFFERENT
     // CVE. Pure cosine can't tell CVE-123 from CVE-456, but they are distinct
     // facts — crush it.
@@ -589,10 +827,32 @@ pub fn claim_mismatch(ground_truth: &str, answer: &str) -> bool {
     // all-figures-no-severity 0.9995 (rides). So figures are required, severity
     // word is NOT — wrong severity is caught by the mismatch gate above.
     let gt_figs = claim_figures(ground_truth);
+    let ans_figs = claim_figures(answer);
+    if !gt_figs.is_empty() && !gt_figs.iter().all(|gf| ans_figs.contains(gf)) {
+        return true;
+    }
+
+    // Extra-figure gate: if the answer introduces a numeric claim that does
+    // NOT appear in the ground truth AND that ground truth already states
+    // figures, treat it as a confident-but-wrong fabrication (e.g. "affecting
+    // over 100,000 servers"). Champion probes (extra figure vs correct) → crush.
+    // Excludes bare CVE-serial digits and version numbers which are secondary
+    // facts, and skips GT figures themselves (they're covered by completeness).
     if !gt_figs.is_empty() {
-        let ans_figs = claim_figures(answer);
-        if !gt_figs.iter().all(|gf| ans_figs.contains(gf)) {
-            return true;
+        for af in &ans_figs {
+            if gt_figs.contains(af) {
+                continue; // matches a GT figure, allowed
+            }
+            // Single-digit tokens are still allowed if not already filtered
+            // at the extract layer (we skipped len<2 there).
+            // Tolerance: very small numeric additions that read as ordinals
+            // (1, 2, 3...) rarely qualify as confident claims — let them
+            // through unless they're already flagged as a CVE-internal serial.
+            // Only flag distinctive multi-digit figures (>= 100) which read as
+            // counts, percentages, or external scale claims.
+            if af.abs() >= 100 {
+                return true;
+            }
         }
     }
 

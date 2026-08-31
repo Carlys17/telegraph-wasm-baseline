@@ -285,9 +285,12 @@ pub unsafe extern "C" fn rank_answer(
     // "critical" from "high" or "network" from "adjacent" — a wrong-but-plausible
     // categorical answer saturates the composite to ~1.0. This gate crushes the score
     // when the answer actively contradicts a categorical fact (severity, attack
-    // vector, or wrong-figure-with-no-overlap) the ground truth states.
+    // vector, or wrong-figure-with-no-overlap) the ground truth states. v17:
+    // graded crush — more missing GT figures crush harder, matching the
+    // champion's completion-style scoring and avoiding ties against partial-good
+    // answers.
     if antigame::claim_mismatch(ground_truth, miner_answer) {
-        return antigame::CRUSH_SCORE;
+        return antigame::graded_crush(ground_truth, miner_answer);
     }
 
     composite_v3(relevance, correctness, lexical)
@@ -346,7 +349,7 @@ pub unsafe extern "C" fn rank_answer_cached(
 
     // v14 hybrid: categorical claim gate (same as rank_answer).
     if antigame::claim_mismatch(ground_truth, miner_answer) {
-        return antigame::CRUSH_SCORE;
+        return antigame::graded_crush(ground_truth, miner_answer);
     }
 
     composite_v3(relevance, correctness, lexical)
@@ -388,7 +391,7 @@ pub unsafe extern "C" fn breakdown_answer(
         0.0
     } else if antigame::claim_mismatch(ground_truth, miner_answer) {
         // v14 hybrid: categorical claim gate (same as rank_answer).
-        antigame::CRUSH_SCORE
+        antigame::graded_crush(ground_truth, miner_answer)
     } else {
         composite_v3(relevance, correctness, lexical)
     };
